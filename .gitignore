@@ -38,3 +38,23 @@ c5_pin_model_dump.txt
 *_netlist
 *.cdf
 **/.DS_Store
+
+# Local build outputs.
+*.o
+*.d
+*.elf
+*.ll
+/build/
+dist/
+Main_MiSTer/
+
+# Release payloads are published via GitHub Releases, not tracked in source.
+old-builds/
+test-builds/
+Groovy.rbf
+hps_linux/MiSTer_groovy
+hps_linux/MiSTer_groovy_XDP
+hps_linux/_old/
+hps_linux/_Utility/
+hps_linux/src/MiSTer_groovy
+hps_linux/src/MiSTer_groovy_XDP

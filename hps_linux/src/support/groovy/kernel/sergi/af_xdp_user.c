@@ -180,7 +180,6 @@ static struct xsk_socket_info *xsk_configure_socket(struct config *cfg,
 	xsk_info = calloc(1, sizeof(*xsk_info));
 	if (!xsk_info)
 		return NULL;
-	printf("pas %d %s : cfg->xdp_flags %d\n",custom_xsk, cfg->ifname, cfg->xdp_flags);
 	xsk_info->umem = umem;
 	xsk_cfg.rx_size = XSK_RING_CONS__DEFAULT_NUM_DESCS;
 	xsk_cfg.tx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS;
@@ -192,7 +191,6 @@ static struct xsk_socket_info *xsk_configure_socket(struct config *cfg,
 				 &xsk_info->tx, &xsk_cfg);
 	if (ret)
 		goto error_exit;
-	printf("pas 2\n");
 	if (custom_xsk) {
 		ret = xsk_socket__update_xskmap(xsk_info->xsk, xsk_map_fd);
 		if (ret)
@@ -289,7 +287,6 @@ static bool process_packet(struct xsk_socket_info *xsk,
 	 * - Just return all data with MAC/IP swapped, and type set to
 	 *   ICMPV6_ECHO_REPLY
 	 * - Recalculate the icmp checksum */
-	printf("paquet %d\n", len);
 	if (false) {
 		int ret;
 		uint32_t tx_idx = 0;

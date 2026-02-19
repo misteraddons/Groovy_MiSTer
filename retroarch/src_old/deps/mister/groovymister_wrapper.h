@@ -138,7 +138,7 @@ typedef struct MODULE_API_GMW
 	char*(*get_pBufferAudio)(void);
 	void (*audio)(uint16_t soundSize);
 	void (*waitSync)(void);
-	void (*diffTimeRaster)(void);
+	int (*diffTimeRaster)(void);
 	uint32_t (*getACK)(uint8_t dwMilliseconds);
 	void (*getStatus)(gmw_fpgaStatus* status);
 	void (*bindInputs)(const char* misterHost);

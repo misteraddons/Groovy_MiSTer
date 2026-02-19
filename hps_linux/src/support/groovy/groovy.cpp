@@ -10,7 +10,6 @@
 
 /* UDP server */
 #include <sys/socket.h>
-#include <ifaddrs.h>
 #include <netdb.h>
 #include <sys/ioctl.h>
 #include <net/if.h>	//ifconfig down/up
@@ -25,6 +24,7 @@
 #include <netinet/udp.h>
 #include <netinet/ip.h>
 #include <netinet/ether.h>
+#include <linux/if_ether.h>
 #include <linux/if_link.h> //DRV_MODE
 #endif
 
@@ -132,7 +132,7 @@ static FILE * fp = NULL;
 
 #define LOG(sev,fmt, ...) do {	\
 			        if (sev == 0) printf(fmt, __VA_ARGS__);	\
-			        if (sev <= doVerbose) { \
+			        if (sev <= doVerbose && fp) { \
 			        	clock_gettime(CLOCK_MONOTONIC, &logTS); \
 			        	difMs = (difMs != 0) ? diff_in_ms(&logTS_ant, &logTS) : -1; \
 					fprintf(fp, "[%06.3f]", difMs); \
@@ -272,6 +272,7 @@ static void *packet_buffer;
 
 /* General Server variables */
 static int groovyServer = 0;
+static const char network_interface[] = "eth0";
 static int sockfd;
 static struct sockaddr_in servaddr;
 static struct sockaddr_in clientaddr;
@@ -343,6 +344,135 @@ static uint8_t isConnected = 0;
 static uint8_t isConnectedInputs = 0;
 static uint8_t isConnectedGMC = 0;
 
+static unsigned long long stat_invalid_packets = 0;
+static unsigned long long stat_unknown_packets = 0;
+static unsigned long long stat_udp_loss = 0;
+static unsigned long long stat_xdp_rx_packets = 0;
+static unsigned long long stat_xdp_short_frames = 0;
+static unsigned long long stat_xdp_non_udp_frames = 0;
+static unsigned long long stat_xdp_invalid_udp_frames = 0;
+static unsigned long long stat_xdp_tx_drops = 0;
+static unsigned long long stat_xdp_umem_free_min = 0;
+
+static bool groovy_command_length_valid(uint8_t command, int len)
+{
+	switch (command)
+	{
+		case CMD_GET_VERSION:
+		case CMD_CLOSE:
+		case CMD_GET_STATUS:
+			return len == 1;
+		case CMD_INIT:
+			return len == 4 || len == 5;
+		case CMD_SWITCHRES:
+			return len == 26;
+		case CMD_AUDIO:
+			return len == 3;
+		case CMD_BLIT_VSYNC:
+			return len == 7 || len == 11;
+		case CMD_BLIT_FIELD_VSYNC:
+			return len == 8 || len == 9 || len == 12 || len == 13;
+		default:
+			return false;
+	}
+}
+
+static bool groovy_command_known(uint8_t command)
+{
+	switch (command)
+	{
+		case CMD_GET_VERSION:
+		case CMD_CLOSE:
+		case CMD_INIT:
+		case CMD_SWITCHRES:
+		case CMD_AUDIO:
+		case CMD_GET_STATUS:
+		case CMD_BLIT_VSYNC:
+		case CMD_BLIT_FIELD_VSYNC:
+			return true;
+		default:
+			return false;
+	}
+}
+
+static void groovy_note_invalid_packet(const char *reason, uint8_t command, int len)
+{
+	stat_invalid_packets++;
+	LOG(1, "[PACKET_DROP][%s cmd=%u len=%d]\n", reason, command, len);
+}
+
+static bool groovy_validate_command_packet(char *packet, int len)
+{
+	if (len <= 0)
+	{
+		groovy_note_invalid_packet("empty", 0, len);
+		return false;
+	}
+
+	uint8_t command = (uint8_t)packet[0];
+	if (!groovy_command_known(command))
+	{
+		stat_unknown_packets++;
+		LOG(1, "[PACKET_DROP][unknown cmd=%u len=%d]\n", command, len);
+		return false;
+	}
+
+	if (!groovy_command_length_valid(command, len))
+	{
+		groovy_note_invalid_packet("length", command, len);
+		return false;
+	}
+
+	if ((command == CMD_SWITCHRES || command == CMD_AUDIO || command == CMD_GET_STATUS ||
+		command == CMD_BLIT_VSYNC || command == CMD_BLIT_FIELD_VSYNC) && !poc)
+	{
+		groovy_note_invalid_packet("not_initialized", command, len);
+		return false;
+	}
+
+	return true;
+}
+
+static void groovy_note_udp_loss(uint32_t frame, uint32_t received, uint32_t total, int len)
+{
+	stat_udp_loss++;
+	LOG(0, "[UDP_ERROR][fr=%d recv=%d/%d len=%d]\n", frame, received, total, len);
+}
+
+static void groovy_log_runtime_stats(int severity)
+{
+	LOG(severity, "[STATS][drop=%llu unknown=%llu udp_loss=%llu xdp_rx=%llu xdp_short=%llu xdp_non_udp=%llu xdp_invalid=%llu xdp_tx_drop=%llu xdp_umem_free_min=%llu]\n",
+		stat_invalid_packets,
+		stat_unknown_packets,
+		stat_udp_loss,
+		stat_xdp_rx_packets,
+		stat_xdp_short_frames,
+		stat_xdp_non_udp_frames,
+		stat_xdp_invalid_udp_frames,
+		stat_xdp_tx_drops,
+		stat_xdp_umem_free_min);
+}
+
+#ifdef _AF_XDP
+static const uint32_t XDP_UDP_HEADER_LEN = ETH_HLEN + sizeof(struct iphdr) + sizeof(struct udphdr);
+
+static void groovy_note_xdp_rx_batch(int packets, unsigned long long free_frames, unsigned long long outstanding_tx)
+{
+	stat_xdp_rx_packets += packets;
+	if (stat_xdp_umem_free_min == 0 || free_frames < stat_xdp_umem_free_min)
+	{
+		stat_xdp_umem_free_min = free_frames;
+	}
+	LOG(3, "[XDP_STATS][rx=%d free=%llu tx=%llu]\n", packets, free_frames, outstanding_tx);
+}
+
+static void groovy_note_xdp_tx_drop(const char *path)
+{
+	stat_xdp_tx_drops++;
+	LOG(0, "[XDP_TX_DROP][%s]\n", path);
+}
+#endif
+
 
 /* FPGA HPS EXT STATUS */
 static uint16_t fpga_vga_vcount = 0;
@@ -385,21 +515,34 @@ static inline void initDDR()
 
 static void initVerboseFile()
 {
+	if (fp && fp != stderr)
+	{
+		fclose(fp);
+	}
+
 	fp = fopen("/tmp/groovy.log", "wt");
 	if (!fp)
 	{
-		LOG(0, "groovy.log %s\n", "error");
+		fp = stderr;
+		logTime = GetTimer(1000);
+		return;
 	}
+
 	struct stat stats;
-    	if (fstat(fileno(fp), &stats) == -1)
-    	{
-        	LOG(0, "groovy.log stats %s\n", "error");
-    	}
-    	if (setvbuf(fp, NULL, _IOFBF, stats.st_blksize) != 0)
-    	{
-        	LOG(0, "setvbuf failed %s \n", "error");
-    	}
-    	logTime = GetTimer(1000);
+	if (fstat(fileno(fp), &stats) == -1)
+	{
+		logTime = GetTimer(1000);
+		return;
+	}
+
+	size_t block_size = stats.st_blksize > 0 ? (size_t)stats.st_blksize : 4096;
+	if (setvbuf(fp, NULL, _IOFBF, block_size) != 0)
+	{
+		logTime = GetTimer(1000);
+		return;
+	}
+
+	logTime = GetTimer(1000);
 
 }
 
@@ -921,6 +1064,7 @@ static void groovy_send_joysticks()
 		ret = xsk_ring_prod__reserve(&xsk_socket->tx, 1, &tx_idx);
 		if (ret != 1) {
 			// No more transmit slots, drop the packet
+			groovy_note_xdp_tx_drop("inputs_joystick");
 			LOG(0, "[ACK_%s][Failed]\n", "STATUS");
 			return;
 		}
@@ -984,6 +1128,7 @@ static void groovy_send_ps2()
 		ret = xsk_ring_prod__reserve(&xsk_socket->tx, 1, &tx_idx);
 		if (ret != 1) {
 			// No more transmit slots, drop the packet
+			groovy_note_xdp_tx_drop("inputs_ps2");
 			LOG(0, "[ACK_%s][Failed]\n", "STATUS");
 			return;
 		}
@@ -1034,6 +1179,7 @@ static void sendVersion()
 		ret = xsk_ring_prod__reserve(&xsk_socket->tx, 1, &tx_idx);
 		if (ret != 1) {
 			// No more transmit slots, drop the packet
+			groovy_note_xdp_tx_drop("version");
 			LOG(0, "[VERSION_%s][Failed]\n", "STATUS");
 			return;
 		}
@@ -1104,6 +1250,7 @@ static void sendACK(uint32_t udp_frame, uint16_t udp_vsync)
 		ret = xsk_ring_prod__reserve(&xsk_socket->tx, 1, &tx_idx);
 		if (ret != 1) {
 			// No more transmit slots, drop the packet
+			groovy_note_xdp_tx_drop("ack");
 			LOG(0, "[ACK_%s][Failed]\n", "STATUS");
 			return;
 		}		
@@ -1261,6 +1408,7 @@ static void setBlit(uint32_t udp_frame, uint8_t udp_field, uint32_t udp_lz4_size
 	{
 		groovy_FPGA_status(0);
 		LOG(1, "[GET_STATUS][DDR fr=%d bl=%d][GPU fr=%d vc=%d fskip=%d vb=%d fd=%d][VRAM px=%d queue=%d sync=%d free=%d eof=%d][AUDIO=%d][LZ4 inf=%d]\n", poc->PoC_frame_ddr, numBlit, fpga_vga_frame, fpga_vga_vcount, fpga_vga_frameskip, fpga_vga_vblank, fpga_vga_f1, fpga_vram_pixels, fpga_vram_queue, fpga_vram_synced, fpga_vram_ready, fpga_vram_end_frame, fpga_audio, fpga_lz4_uncompressed);
+		groovy_log_runtime_stats(1);
 	}
 
 	if (!doVerbose && !fpga_vram_synced)
@@ -1459,7 +1607,7 @@ static struct xsk_socket_info *xsk_configure_socket(struct xsk_umem_info *umem)
 	xsk_cfg.bind_flags = XDP_COPY;     		
 	xsk_cfg.bind_flags |= XDP_USE_NEED_WAKEUP;
 	xsk_cfg.libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD;
-	ret = xsk_socket__create(&xsk_info->xsk, "eth0", 0, umem->umem, &xsk_info->rx, &xsk_info->tx, &xsk_cfg);
+	ret = xsk_socket__create(&xsk_info->xsk, network_interface, 0, umem->umem, &xsk_info->rx, &xsk_info->tx, &xsk_cfg);
 	if (ret)
 	{
 		LOG(0,"[XDP][xsk_socket__create][error %d]\n", ret);
@@ -1532,73 +1680,81 @@ xsk_socket_error:
 
 static int setMTU()
 {
+	if (if_nametoindex(network_interface) == 0)
+	{
+		LOG(0, "[ETH][%s]\n", "eth0 not found");
+		return -1;
+	}
+
+	LOG(1, "[ETH][START iface=%s]\n", network_interface);
+
 	int err = 0;
-	char *net = getNet(1);
-	if (net)
+	int mtu_sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	if (mtu_sockfd < 0)
 	{
-		LOG(1, "[ETH][START %s]\n", net);
+		LOG(0, "[ETH][socket][error %d]\n", mtu_sockfd);
+		return -1;
 	}
-	else
-	{
-		net = getNet(2);
-		if (net)
-		{
-			LOG(1, "[ETH][START %s]\n", net);
-		}
-		else
-		{
-			goto mtu_error;
-		}
-	}
-		
-	sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    	if (sockfd < 0)
-    	{
-    		LOG(0, "[ETH]][error %d]\n", sockfd);
-    		goto mtu_error;
-    	}
 
 	struct ifreq ifr;
-        memset(&ifr, 0, sizeof(ifr));
-        strncpy((char *)ifr.ifr_name, "eth0", IFNAMSIZ);
-        err = ioctl (sockfd, SIOCGIFMTU, &ifr);
+	memset(&ifr, 0, sizeof(ifr));
+	strncpy((char *)ifr.ifr_name, network_interface, IFNAMSIZ - 1);
+	ifr.ifr_name[IFNAMSIZ - 1] = '\0';
+	err = ioctl(mtu_sockfd, SIOCGIFMTU, &ifr);
 	if (err < 0)
-    	{
-    		LOG(0, "[ETH0][SIOCGIFMTU mtu][error %d]\n", err);
-    		goto mtu_error;
+	{
+		LOG(0, "[%s][SIOCGIFMTU][error %d]\n", network_interface, err);
+		close(mtu_sockfd);
+		return -1;
 	}
+
+	struct ifreq ifr_state;
+	memset(&ifr_state, 0, sizeof(ifr_state));
+	strncpy((char *)ifr_state.ifr_name, network_interface, IFNAMSIZ - 1);
+	ifr_state.ifr_name[IFNAMSIZ - 1] = '\0';
+	err = ioctl(mtu_sockfd, SIOCGIFFLAGS, &ifr_state);
+	if (err < 0)
+	{
+		LOG(0, "[%s][SIOCGIFFLAGS][error %d]\n", network_interface, err);
+		close(mtu_sockfd);
+		return -1;
+	}
+
+	short original_flags = ifr_state.ifr_flags;
 	if ((doJumboFrames && ifr.ifr_mtu == 1500) || (!doJumboFrames && ifr.ifr_mtu != 1500)) // kernel 5.13 stmmac needs stop eth for change mtu (fixed on new kernels)
 	{
-		ifr.ifr_flags = 1 & ~IFF_UP;
-		err = ioctl(sockfd, SIOCSIFFLAGS, &ifr);
+		ifr_state.ifr_flags = original_flags & ~IFF_UP;
+		err = ioctl(mtu_sockfd, SIOCSIFFLAGS, &ifr_state);
 		if (err < 0)
-    		{
-    			LOG(0, "[ETH0][SIOCSIFFLAGS down][error %d]\n", err);
-    			goto mtu_error;
+		{
+			LOG(0, "[%s][SIOCSIFFLAGS down][error %d]\n", network_interface, err);
+			close(mtu_sockfd);
+			return -1;
 		}
-		LOG(1, "[ETH0][%s]\n", "DOWN");
+		LOG(1, "[%s][%s]\n", network_interface, "DOWN");
+
 		ifr.ifr_mtu = doJumboFrames ? 3800 : 1500;
-		if (ioctl(sockfd, SIOCSIFMTU, (caddr_t)&ifr) < 0)
+		if (ioctl(mtu_sockfd, SIOCSIFMTU, (caddr_t)&ifr) < 0)
 		{
 			ifr.ifr_mtu = 1500;
 			doJumboFrames = 0;
 		}
 		LOG(1, "[ETH][MTU 1500 -> %d]\n", ifr.ifr_mtu);
-		ifr.ifr_flags = 1 | IFF_UP;
-		err = ioctl(sockfd, SIOCSIFFLAGS, &ifr);
+
+		ifr_state.ifr_flags = original_flags | IFF_UP;
+		err = ioctl(mtu_sockfd, SIOCSIFFLAGS, &ifr_state);
 		if (err < 0)
-    		{
-    			LOG(0, "[ETH0][SIOCSIFFLAGS up][error %d]\n", err);
-    			goto mtu_error;
+		{
+			LOG(0, "[%s][SIOCSIFFLAGS up][error %d]\n", network_interface, err);
+			close(mtu_sockfd);
+			return -1;
 		}
-		LOG(1, "[ETH0][%s]\n", "UP");	
-		close(sockfd);
-		goto mtu_error;	
+		LOG(1, "[%s][%s]\n", network_interface, "UP");
+		close(mtu_sockfd);
+		return -1;
 	}
-	close(sockfd);	
+	close(mtu_sockfd);
 	return 0;
-	
-mtu_error: return -1;
 }
 
 #ifdef _AF_XDP
@@ -1618,9 +1774,9 @@ static void groovy_xdp_server_init()
 		goto init_error_xdp;	
 	}	
 	
-	setRXAffinity(0);
+	setRXAffinity(network_interface, 0);
 
-	// load ebpf program and attach to kernel eth0
+	// load ebpf program and attach to selected interface
 	memset(&prog_load_attr, 0, sizeof(struct bpf_prog_load_attr));
 	prog_load_attr.prog_type = BPF_PROG_TYPE_XDP;
 	prog_load_attr.file = "/usr/lib/arm-linux-gnueabihf/bpf/groovy_xdp_kern.o";
@@ -1633,8 +1789,8 @@ static void groovy_xdp_server_init()
 		LOG(0, "[XDP][bpf_prog_load_xattr][%d]\n", prog_fd);
 		goto init_error_xdp;
 	}
-	err = bpf_set_link_xdp_fd(if_nametoindex("eth0"), prog_fd, XDP_FLAGS_DRV_MODE);
-	//err = bpf_set_link_xdp_fd(if_nametoindex("eth0"), prog_fd, XDP_FLAGS_SKB_MODE);
+	err = bpf_set_link_xdp_fd(if_nametoindex(network_interface), prog_fd, XDP_FLAGS_DRV_MODE);
+	//err = bpf_set_link_xdp_fd(if_nametoindex(network_interface), prog_fd, XDP_FLAGS_SKB_MODE);
 	
 	if (err < 0)
 	{
@@ -1653,7 +1809,7 @@ static void groovy_xdp_server_init()
 		goto init_error_xdp;
 	}
 	// attach using native mode driver stmmac
-	err = xdp_program__attach(prog, if_nametoindex("eth0"), XDP_MODE_NATIVE, 0);
+	err = xdp_program__attach(prog, if_nametoindex(network_interface), XDP_MODE_NATIVE, 0);
 	if (err)
 	{
 		if (err != -16) //prev.attached
@@ -1729,7 +1885,7 @@ static void groovy_udp_server_init()
 		goto init_error_udp;	
 	}
 	
-	setRXAffinity(0);
+	setRXAffinity(network_interface, 0);
 	
 	sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     	if (sockfd < 0)
@@ -1965,12 +2121,13 @@ static inline void process_packet(char *recvbufPtr, int len)
 					{
 						memcpy((char *) &recvbuf[0], recvbufPtr, len);
 						recvbufPtr = (char *) &recvbuf[0];
+						stat_udp_loss++;
 						LOG(0,"[UDP_ERROR][RECONFIG fr=%d recv=%d/%d prev_len=%d len=%d]\n", poc->PoC_frame_ddr, poc->PoC_bytes_recv, tota_len, prev_len, len);
 					}
 					else
 					{
-						LOG(0,"[UDP_ERROR][fr=%d recv=%d/%d len=%d]\n", poc->PoC_frame_ddr, poc->PoC_bytes_recv, tota_len, len);
-						len = -1;
+						groovy_note_udp_loss(poc->PoC_frame_ddr, poc->PoC_bytes_recv, tota_len, len);
+						return;
 					}
 				}
 			}
@@ -1978,6 +2135,11 @@ static inline void process_packet(char *recvbufPtr, int len)
 
 		if (!isBlitting)
 		{
+			if (!groovy_validate_command_packet(recvbufPtr, len))
+			{
+				return;
+			}
+
     			switch (recvbufPtr[0])
     			{
     				case CMD_GET_VERSION:
@@ -2042,6 +2204,7 @@ static inline void process_packet(char *recvbufPtr, int len)
 						groovy_FPGA_status(1);
 						sendACK(0, 0);
 			       			LOG(1, "[CMD_GET_STATUS][%d][GPU fr=%d vc=%d fskip=%d vb=%d fd=%d][VRAM px=%d queue=%d sync=%d free=%d eof=%d][AUDIO=%d][LZ4 inf=%d]\n", recvbufPtr[0], fpga_vga_frame, fpga_vga_vcount, fpga_vga_frameskip, fpga_vga_vblank, fpga_vga_f1, fpga_vram_pixels, fpga_vram_queue, fpga_vram_synced, fpga_vram_ready, fpga_vram_end_frame, fpga_audio, fpga_lz4_uncompressed);
+						groovy_log_runtime_stats(1);
 
 					}
 				}; break;
@@ -2142,6 +2305,65 @@ static inline void process_packet(char *recvbufPtr, int len)
 
 
 #ifdef _AF_XDP
+static inline bool xdp_validate_udp_frame(uint32_t len, struct ethhdr *eth, struct iphdr **ip_out, struct udphdr **udp_out, int *udp_payload_len)
+{
+	if (len < XDP_UDP_HEADER_LEN)
+	{
+		stat_xdp_short_frames++;
+		LOG(1, "[PACKET_DROP][xdp_short len=%u]\n", len);
+		return false;
+	}
+
+	if (ntohs(eth->h_proto) != ETH_P_IP)
+	{
+		stat_xdp_non_udp_frames++;
+		return false;
+	}
+
+	struct iphdr *ip = (struct iphdr *)((uint8_t *)eth + ETH_HLEN);
+	uint32_t ip_header_len = ip->ihl * 4;
+	if (ip->version != 4 || ip->ihl < 5 || ip_header_len != sizeof(struct iphdr))
+	{
+		stat_xdp_invalid_udp_frames++;
+		LOG(1, "[PACKET_DROP][xdp_ip_header len=%u ihl=%u version=%u]\n", len, ip->ihl, ip->version);
+		return false;
+	}
+
+	if (ip->protocol != IPPROTO_UDP)
+	{
+		stat_xdp_non_udp_frames++;
+		return false;
+	}
+
+	if (len < ETH_HLEN + ip_header_len + sizeof(struct udphdr))
+	{
+		stat_xdp_short_frames++;
+		LOG(1, "[PACKET_DROP][xdp_short_udp len=%u]\n", len);
+		return false;
+	}
+
+	struct udphdr *udp = (struct udphdr *)(((uint8_t *)ip) + ip_header_len);
+	int udp_total_len = ntohs(udp->len);
+	if (udp_total_len < (int)sizeof(struct udphdr))
+	{
+		stat_xdp_invalid_udp_frames++;
+		LOG(1, "[PACKET_DROP][xdp_udp_len len=%u udp_len=%d]\n", len, udp_total_len);
+		return false;
+	}
+
+	if (len < ETH_HLEN + ip_header_len + (uint32_t)udp_total_len)
+	{
+		stat_xdp_short_frames++;
+		LOG(1, "[PACKET_DROP][xdp_truncated_udp len=%u udp_len=%d]\n", len, udp_total_len);
+		return false;
+	}
+
+	*ip_out = ip;
+	*udp_out = udp;
+	*udp_payload_len = udp_total_len - sizeof(struct udphdr);
+	return true;
+}
+
 static inline int process_packet_eth(struct xsk_socket_info *xsk, uint64_t addr, uint32_t len)
 {
 	if (!len)
@@ -2152,11 +2374,14 @@ static inline int process_packet_eth(struct xsk_socket_info *xsk, uint64_t addr,
 	uint8_t tmp_mac[ETH_ALEN];
 	struct in_addr tmp_ip;
 	struct ethhdr *eth = (struct ethhdr *) xsk_umem__get_data(xsk->umem->buffer, addr);
-	struct iphdr *ip = (struct iphdr *) ((uint8_t *) eth + ETH_HLEN); //14 + 20
-	struct udphdr *udp = (struct udphdr *) (((char *)ip ) + sizeof(iphdr)); //34 + 8
-	int udp_len;
+	struct iphdr *ip = NULL;
+	struct udphdr *udp = NULL;
+	int udp_len = 0;
 	char* data_pointer = (char*)eth;
-	udp_len = ntohs(udp->len) - sizeof(struct udphdr);
+	if (!xdp_validate_udp_frame(len, eth, &ip, &udp, &udp_len))
+	{
+		return 0;
+	}
 
 	//set headers preparing send acks
 	if (!isConnected && ntohs(udp->dest) == UDP_PORT)
@@ -2319,6 +2544,8 @@ static inline void handle_receive_packets(struct xsk_socket_info *xsk)
 		*/
 		return;
 	}
+
+	groovy_note_xdp_rx_batch(rcvd, xsk_umem_free_frames(xsk), xsk->outstanding_tx);
 		
 	//Stuff the ring with as much frames as possible when not blitting
 	//stock_frames = xsk_prod_nb_free(&xsk->umem->fq, xsk_umem_free_frames(xsk));	
@@ -2456,10 +2683,10 @@ void groovy_stop()
 				shmem_unmap(packet_buffer, packet_buffer_size);
 				LOG(0, "[XDP][%s]\n", "Unmap umem");
 			}
-			bpf_set_link_xdp_fd(if_nametoindex("eth0"), -1, XDP_FLAGS_DRV_MODE);
-			LOG(0, "[XDP][%s]\n", "Unloading xdp eth0");
-			//bpf_set_link_xdp_fd(if_nametoindex("eth0"), -1, XDP_FLAGS_SKB_MODE);			
-			 
+			bpf_set_link_xdp_fd(if_nametoindex(network_interface), -1, XDP_FLAGS_DRV_MODE);
+			LOG(0, "[XDP][Unloading xdp %s]\n", network_interface);
+			//bpf_set_link_xdp_fd(if_nametoindex(network_interface), -1, XDP_FLAGS_SKB_MODE);
+
 		}
 #endif		
 		if (sockfdInputs)
@@ -2489,6 +2716,7 @@ void groovy_poll()
 			groovy_FPGA_status(0);
 			//LOG(3, "[GET_STATUS][DDR fr=%d bl=%d][GPU vc=%d fr=%d fskip=%d vb=%d fd=%d][VRAM px=%d queue=%d sync=%d free=%d eof=%d][LZ4 state_1=%d inf=%d wr=%d, run=%d resume=%d t1=%d t2=%d cmd_fskip=%d stop=%d AB=%d com=%d grav=%d lleg=%d, sub=%d blit=%d]\n", poc->PoC_frame_ddr, numBlit, fpga_vga_vcount, fpga_vga_frame, fpga_vga_frameskip, fpga_vga_vblank, fpga_vga_f1, fpga_vram_pixels, fpga_vram_queue, fpga_vram_synced, fpga_vram_ready, fpga_vram_end_frame, fpga_lz4_state, fpga_lz4_uncompressed, fpga_lz4_writed, fpga_lz4_run, fpga_lz4_resume, fpga_lz4_test1, fpga_lz4_test2, fpga_lz4_cmd_fskip, fpga_lz4_stop, fpga_lz4_ABCD, fpga_lz4_compressed, fpga_lz4_gravats, fpga_lz4_llegits, fpga_lz4_subframe_bytes, fpga_lz4_subframe_blit);
 			LOG(3, "[GET_STATUS][DDR fr=%d bl=%d][GPU fr=%d vc=%d fskip=%d vb=%d fd=%d][VRAM px=%d queue=%d sync=%d free=%d eof=%d][LZ4 un=%d]\n", poc->PoC_frame_ddr, numBlit, fpga_vga_frame, fpga_vga_vcount, fpga_vga_frameskip, fpga_vga_vblank, fpga_vga_f1, fpga_vram_pixels, fpga_vram_queue, fpga_vram_synced, fpga_vram_ready, fpga_vram_end_frame, fpga_lz4_uncompressed);
+			groovy_log_runtime_stats(3);
 		}
 
 		if (!doXDPServer)
@@ -2673,6 +2901,7 @@ void groovy_user_io_file_gmc(const char* name)
 			ret = xsk_ring_prod__reserve(&xsk_socket->tx, 1, &tx_idx);
 			if (ret != 1) {
 				// No more transmit slots, drop the packet
+				groovy_note_xdp_tx_drop("gmc");
 				LOG(0, "[ACK_%s][Failed]\n", "STATUS");
 				return;
 			}	
@@ -2699,8 +2928,3 @@ void groovy_user_io_file_gmc(const char* name)
     	}
     	
 }
-
-
-
-
-     

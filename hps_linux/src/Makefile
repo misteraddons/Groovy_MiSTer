@@ -29,10 +29,10 @@ INCLUDE += -I./lib/bluetooth
 INCLUDE += -I./lib/serial_server/library
 
 ifeq ($(_AF_XDP), 1)
+INCLUDE += -I./support/groovy/kernel/lib/xdp-tools/headers
 INCLUDE += -I./lib/libelf
 INCLUDE += -I./lib/libbpf
 INCLUDE += -I./lib/libxdp
-INCLUDE += -I./support/groovy/kernel/usr/include
 endif
 
 ifeq ($(_AF_XDP), 1)
@@ -58,7 +58,7 @@ IMG =     $(wildcard *.png)
 
 IMLIB2_LIB  = -Llib/imlib2 -lfreetype -lbz2  -lpng16  -lz -lImlib2
 ifeq ($(_AF_XDP), 1)
-AFXDP_LIB = -lelf lib/libxdp/libxdp.a lib/libbpf/libbpf.a
+AFXDP_LIB = -Llib/libelf -lelf lib/libxdp/libxdp.a lib/libbpf/libbpf.a
 endif
 
 OBJ	= $(C_SRC:.c=.c.o) $(CPP_SRC:.cpp=.cpp.o) $(IMG:.png=.png.o)
@@ -88,7 +88,7 @@ $(PRJ): $(OBJ)
 clean:
 	$(Q)rm -f *.elf *.map *.lst *.user *~ $(PRJ)
 	$(Q)rm -rf obj DTAR* x64
-	$(Q)find . \( -name '*.o' -o -name '*.d' -o -name '*.bak' -o -name '*.rej' -o -name '*.org' \) -exec rm -f {} \;
+	$(Q)find . \( -name '*.o' -o -name '*.d' -o -name '*.bak' -o -name '*.rej' \) -exec rm -f {} \;
 
 %.c.o: %.c
 	$(Q)$(info $<)

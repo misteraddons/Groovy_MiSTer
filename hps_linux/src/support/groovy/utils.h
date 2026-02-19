@@ -272,6 +272,6 @@ unsigned long sum_udp_checksum(struct iphdr *iph, uint16_t payload_len);
 void compute_udp_checksum(unsigned short *ipPayload, unsigned long sum);
 char* getNet(int spec);
 void setARMClock(uint8_t clock);
-void setRXAffinity(int cpu);
+void setRXAffinity(const char *interface_name, int cpu);
 
 #endif

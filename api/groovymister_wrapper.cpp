@@ -227,7 +227,7 @@ MODULE_API_GMW void gmw_getJoyInputs(gmw_fpgaJoyInputs* joyInputs)
 	}
 	else
 	{
-		memset(&joyInputs, 0, sizeof(joyInputs));
+		memset(joyInputs, 0, sizeof(*joyInputs));
 		printf("[MiSTer] gmw_getJoyInputs failed\n");
 	}
 }
@@ -246,7 +246,7 @@ MODULE_API_GMW void gmw_getPS2Inputs(gmw_fpgaPS2Inputs* ps2Inputs)
 	}
 	else
 	{
-		memset(&ps2Inputs, 0, sizeof(ps2Inputs));
+		memset(ps2Inputs, 0, sizeof(*ps2Inputs));
 		printf("[MiSTer] gmw_getPS2Inputs failed\n");
 	}
 }

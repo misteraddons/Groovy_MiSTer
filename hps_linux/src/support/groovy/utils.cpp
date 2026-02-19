@@ -113,8 +113,9 @@ char* getNet(int spec)
 
 	if (spec && ifa)
 	{
-		strcpy(host, "IP: ");
-		getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in), host + strlen(host), NI_MAXHOST - strlen(host), NULL, 0, NI_NUMERICHOST);
+		snprintf(host, sizeof(host), "IP: ");
+		size_t host_len = strlen(host);
+		getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in), host + host_len, NI_MAXHOST - host_len, NULL, 0, NI_NUMERICHOST);
 	}
 
 	freeifaddrs(ifaddr);
@@ -157,7 +158,7 @@ long get_pid_ksoftirqd(int cpu) {
                     while (fgets(line, sizeof(line), fp_pid)) {
                         if (strncmp(line, "Name:", 5) == 0) {
                             char name[256];
-                            sscanf(line, "Name:\t%s", name);
+                            sscanf(line, "Name:\t%255s", name);
                             if (strncmp(name, "ksoftirqd/0", 11) == 0 && cpu == 0) // softirqs for CPU_SET 0 (normal is PID=11)
                             {
                             	pid_soft = pid;
@@ -197,8 +198,11 @@ int find_eth_irq(const char *interface) {
     
     while (fgets(line, sizeof(line), fp_irq)) {
         if (strstr(line, interface) != NULL) {
-            sscanf(line, "%s %*s %*s %*s %*s %*s %s", irq_number, device_name);
-            if (strstr(device_name, interface) != NULL) 
+            if (sscanf(line, "%7s %*s %*s %*s %*s %*s %255s", irq_number, device_name) != 2)
+            {
+                continue;
+            }
+            if (strstr(device_name, interface) != NULL)
             {    
             	if (sscanf(irq_number, "%d", &irq) != 1)
             	{
@@ -213,13 +217,20 @@ int find_eth_irq(const char *interface) {
     return irq;
 }
 
-void setRXAffinity(int cpu)
+void setRXAffinity(const char *interface_name, int cpu)
 {        
-	int irq = find_eth_irq("eth0"); //39	
+	if (!interface_name || !*interface_name) interface_name = "eth0";
+	if (cpu < 0 || cpu >= CPU_SETSIZE)
+	{
+		printf("[setRXAffinity][cpu][error cpu=%d]\n", cpu);
+		return;
+	}
+
+	int irq = find_eth_irq(interface_name);
 	
 	if (!irq)
 	{
-		printf("[setRXAffinity][irq][error]\n");
+		printf("[setRXAffinity][irq][error iface=%s]\n", interface_name);
 		return;
 	}
 	
@@ -228,14 +239,13 @@ void setRXAffinity(int cpu)
 	unsigned long mask_bits = 0;
 
 	//Set rx irq affinity
-	char numIRQ[2];
-	char strAffinity1[25] = "/proc/irq//smp_affinity"; 	
-	char strAffinity2[25];
-	sprintf(numIRQ, "%d", irq);
-	strncpy(strAffinity2, strAffinity1, 10);
-	strAffinity2[10] = '\0';
-	strcat(strAffinity2, numIRQ);
-	strcat(strAffinity2, strAffinity1 + 10);
+	char strAffinity2[64];
+	int path_len = snprintf(strAffinity2, sizeof(strAffinity2), "/proc/irq/%d/smp_affinity", irq);
+	if (path_len < 0 || path_len >= (int)sizeof(strAffinity2))
+	{
+		printf("[setRXAffinity][path][error irq=%d]\n", irq);
+		return;
+	}
 		
 	fp_irq = fopen(strAffinity2, "w");
     	if (!fp_irq)

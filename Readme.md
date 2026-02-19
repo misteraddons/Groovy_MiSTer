@@ -13,16 +13,19 @@ https://youtu.be/H0175WJFpUs
 - Audio stream
 - Inputs stream (keyboard, mouse, 2 joypads)
 - Native LZ4 uncompress on FPGA
-- [History](https://github.com/psakhis/Groovy_MiSTer/blob/main/history.txt)
+- [History](history.txt)
 
 ## Installation (transfers in binary mode!)
-- Copy MiSTer_groovy to /media/fat 
-- Copy Groovy.rbf to /media/fat/_Utility 
+- Download release artifacts from GitHub Releases.
+- Copy `MiSTer_groovy` to `/media/fat`
+- Copy `Groovy.rbf` to `/media/fat/_Utility`
 - Edit MiSTer.ini and add custom binary at end of file<br />
   <sub>
   [Groovy]<br />
   main=MiSTer_groovy<br />
   </sub>
+
+Build/test payload bundles that used to live in `test-builds/` and `old-builds/` are now release-only assets and are not tracked in source control.
   
 ### Only for XDP high performance feature, some tweaks on Linux are needed
   1. Replace kernel: zImage_dtb file on /media/fat/linux (is same [kernel](MiSTer-devel/Linux-Kernel_MiSTer#55) with some patches for eth0 driver and builded with CONFIG_XDP_SOCKETS=Y)
