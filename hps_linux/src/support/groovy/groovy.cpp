@@ -357,6 +357,12 @@ static unsigned long long stat_xdp_non_udp_frames = 0;
 static unsigned long long stat_xdp_invalid_udp_frames = 0;
 static unsigned long long stat_xdp_tx_drops = 0;
 static unsigned long long stat_xdp_umem_free_min = 0;
+static unsigned long long stat_input_joy_packets = 0;
+static unsigned long long stat_input_ps2_packets = 0;
+static unsigned long long stat_input_keepalives = 0;
+static unsigned long long stat_input_neutralizes = 0;
+
+static void groovy_neutralize_inputs(const char *reason);
 
 static bool groovy_command_length_valid(uint8_t command, int len)
 {
@@ -455,6 +461,11 @@ static void groovy_log_runtime_stats(int severity)
 		stat_xdp_invalid_udp_frames,
 		stat_xdp_tx_drops,
 		stat_xdp_umem_free_min);
+	LOG(severity, "[INPUT_STATS][joy_packets=%llu ps2_packets=%llu keepalives=%llu neutralizes=%llu]\n",
+		stat_input_joy_packets,
+		stat_input_ps2_packets,
+		stat_input_keepalives,
+		stat_input_neutralizes);
 }
 
 #ifdef _AF_XDP
@@ -976,6 +987,7 @@ static void setSwitchres(char *recvbuf)
 
 static void setClose()
 {
+	groovy_neutralize_inputs("close");
 	groovy_FPGA_init(0, 0, 0, 0);
 	isBlitting = 0;
 	usingOldBlit = 0;
@@ -1057,7 +1069,15 @@ static void groovy_send_joysticks()
 	poc->PoC_joystick_keep_alive = 0;
 	if (!doXDPServer)
 	{
-		sendto(sockfdInputs, sendbufPtr, len, MSG_CONFIRM, (struct sockaddr *)&clientaddrInputs, clilen);
+		int sent = sendto(sockfdInputs, sendbufPtr, len, MSG_CONFIRM, (struct sockaddr *)&clientaddrInputs, clilen);
+		if (sent == len)
+		{
+			stat_input_joy_packets++;
+		}
+		else
+		{
+			LOG(0, "[INPUT_DROP][joystick sent=%d len=%d]\n", sent, len);
+		}
 	}
 #ifdef _AF_XDP
 	else
@@ -1095,6 +1115,7 @@ static void groovy_send_joysticks()
 		xsk_socket->outstanding_tx++;
 
 		complete_tx(xsk_socket);
+		stat_input_joy_packets++;
 	}
 #endif
 
@@ -1121,7 +1142,15 @@ static void groovy_send_ps2()
 	poc->PoC_ps2_keep_alive = 0;
 	if (!doXDPServer)
 	{
-		sendto(sockfdInputs, sendbufPtr, len, MSG_CONFIRM, (struct sockaddr *)&clientaddrInputs, clilen);
+		int sent = sendto(sockfdInputs, sendbufPtr, len, MSG_CONFIRM, (struct sockaddr *)&clientaddrInputs, clilen);
+		if (sent == len)
+		{
+			stat_input_ps2_packets++;
+		}
+		else
+		{
+			LOG(0, "[INPUT_DROP][ps2 sent=%d len=%d]\n", sent, len);
+		}
 	}
 #ifdef _AF_XDP
 	else
@@ -1159,8 +1188,64 @@ static void groovy_send_ps2()
 		xsk_socket->outstanding_tx++;
 
 		complete_tx(xsk_socket);
+		stat_input_ps2_packets++;
 	}
 #endif
+}
+
+static void groovy_clear_input_state()
+{
+	if (!poc)
+	{
+		return;
+	}
+
+	poc->PoC_joystick_map1 = 0;
+	poc->PoC_joystick_map2 = 0;
+	poc->PoC_joystick_l_analog_X1 = 0;
+	poc->PoC_joystick_l_analog_Y1 = 0;
+	poc->PoC_joystick_r_analog_X1 = 0;
+	poc->PoC_joystick_r_analog_Y1 = 0;
+	poc->PoC_joystick_l_analog_X2 = 0;
+	poc->PoC_joystick_l_analog_Y2 = 0;
+	poc->PoC_joystick_r_analog_X2 = 0;
+	poc->PoC_joystick_r_analog_Y2 = 0;
+
+	memset(poc->PoC_ps2_keyboard_keys, 0, sizeof(poc->PoC_ps2_keyboard_keys));
+	poc->PoC_ps2_mouse = 0;
+	poc->PoC_ps2_mouse_x = 0;
+	poc->PoC_ps2_mouse_y = 0;
+	poc->PoC_ps2_mouse_z = 0;
+}
+
+static void groovy_neutralize_inputs(const char *reason)
+{
+	if (!poc)
+	{
+		return;
+	}
+
+	uint8_t send_joy = isConnectedInputs && doJoyInputs;
+	uint8_t send_ps2 = isConnectedInputs && doPs2Inputs;
+	if (!send_joy && !send_ps2)
+	{
+		groovy_clear_input_state();
+		return;
+	}
+
+	groovy_clear_input_state();
+	if (send_joy)
+	{
+		poc->PoC_joystick_order++;
+		groovy_send_joysticks();
+	}
+	if (send_ps2)
+	{
+		poc->PoC_ps2_order++;
+		groovy_send_ps2();
+	}
+	stat_input_neutralizes++;
+	LOG(1, "[INPUT_NEUTRAL][reason=%s joy=%d ps2=%d]\n", reason, send_joy, send_ps2);
 }
 
 static void sendVersion()
@@ -1277,12 +1362,14 @@ static void sendACK(uint32_t udp_frame, uint16_t udp_vsync)
 #endif
 	if (poc->PoC_joystick_keep_alive >= KEEP_ALIVE_FRAMES)
 	{
+		stat_input_keepalives++;
 		LOG(2, "[JOY_ACK][%s]\n", "KEEP_ALIVE");
 		groovy_send_joysticks();
 	}
 
 	if (poc->PoC_ps2_keep_alive >= KEEP_ALIVE_FRAMES)
 	{
+		stat_input_keepalives++;
 		LOG(2, "[KBD_ACK][%s]\n", "KEEP_ALIVE");
 		groovy_send_ps2();
 	}

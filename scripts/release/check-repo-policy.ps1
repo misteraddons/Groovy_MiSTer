@@ -49,7 +49,14 @@ try {
         "stat_xdp_rx_packets",
         "fflush(fp)",
         "setvbuf(fp, NULL, _IOLBF",
-        "[LOG][file=/tmp/groovy.log"
+        "[LOG][file=/tmp/groovy.log",
+        "stat_input_joy_packets",
+        "stat_input_ps2_packets",
+        "stat_input_keepalives",
+        "stat_input_neutralizes",
+        "groovy_neutralize_inputs",
+        "[INPUT_STATS]",
+        "[INPUT_NEUTRAL]"
     )) {
         Assert-True ($groovy -match [regex]::Escape($requiredText)) "groovy.cpp is missing packet validation or runtime stat hook: $requiredText"
     }
