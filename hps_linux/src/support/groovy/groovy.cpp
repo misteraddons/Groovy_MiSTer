@@ -998,6 +998,7 @@ static void setClose()
 	
 	user_io_status_set(AUDIO_RATE_OPT, (uint32_t)0);
  	user_io_status_set(AUDIO_CHANNELS_OPT, (uint32_t)0);
+	user_io_status_set(AUDIO_OPT, (uint32_t)0);
  	user_io_status_set(RGB_MODE_OPT, (uint32_t)0);
  	user_io_status_set(LZ4_OPT, (uint32_t)0); 	
 }
@@ -1341,6 +1342,7 @@ static void setInit(uint8_t compression, uint8_t audio_rate, uint8_t audio_chan,
 
  	user_io_status_set(AUDIO_RATE_OPT, (uint32_t)audioRate);
  	user_io_status_set(AUDIO_CHANNELS_OPT, (uint32_t)audioChannels);
+	user_io_status_set(AUDIO_OPT, (uint32_t)(audioChannels != 0));
  	user_io_status_set(RGB_MODE_OPT, (uint32_t)rgbMode);
  	user_io_status_set(LZ4_OPT, (uint32_t)blitCompression);
  	
