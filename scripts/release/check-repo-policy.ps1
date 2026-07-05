@@ -46,10 +46,14 @@ try {
         "[PACKET_DROP]",
         "[STATS]",
         "xdp_validate_udp_frame",
-        "stat_xdp_rx_packets"
+        "stat_xdp_rx_packets",
+        "fflush(fp)",
+        "setvbuf(fp, NULL, _IOLBF",
+        "[LOG][file=/tmp/groovy.log"
     )) {
         Assert-True ($groovy -match [regex]::Escape($requiredText)) "groovy.cpp is missing packet validation or runtime stat hook: $requiredText"
     }
+    Assert-True ($groovy -match '\(\s*sev\s*==\s*0\s*\|\|\s*sev\s*<=\s*doVerbose\s*\)') "LOG must always write severity 0 startup/error lines to the log file"
 
     $gitignore = Read-Text ".gitignore"
     foreach ($pattern in @("*.o", "*.d", "*.elf", "*.ll", "/build/", "dist/", "Main_MiSTer/")) {

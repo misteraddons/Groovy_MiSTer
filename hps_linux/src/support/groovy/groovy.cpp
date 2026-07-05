@@ -131,12 +131,16 @@ static unsigned long logTime = 0;
 static FILE * fp = NULL;
 
 #define LOG(sev,fmt, ...) do {	\
-			        if (sev == 0) printf(fmt, __VA_ARGS__);	\
-			        if (sev <= doVerbose && fp) { \
+			        if (sev == 0) { \
+					printf(fmt, __VA_ARGS__);	\
+					fflush(stdout); \
+				} \
+			        if (fp && (sev == 0 || sev <= doVerbose)) { \
 			        	clock_gettime(CLOCK_MONOTONIC, &logTS); \
 			        	difMs = (difMs != 0) ? diff_in_ms(&logTS_ant, &logTS) : -1; \
 					fprintf(fp, "[%06.3f]", difMs); \
 					fprintf(fp, fmt, __VA_ARGS__);	\
+					fflush(fp); \
                                 	clock_gettime(CLOCK_MONOTONIC, &logTS_ant); \
                                 } \
                            } while (0)
@@ -536,7 +540,7 @@ static void initVerboseFile()
 	}
 
 	size_t block_size = stats.st_blksize > 0 ? (size_t)stats.st_blksize : 4096;
-	if (setvbuf(fp, NULL, _IOFBF, block_size) != 0)
+	if (setvbuf(fp, NULL, _IOLBF, block_size) != 0)
 	{
 		logTime = GetTimer(1000);
 		return;
@@ -550,6 +554,7 @@ static void groovy_FPGA_hps()
 {	                   
     doVerbose = (uint8_t) user_io_status_get(VERBOSE_OPT);        
     initVerboseFile();
+    LOG(0, "[LOG][file=/tmp/groovy.log verbose=%d]\n", doVerbose);
     
     hpsBlit = (uint8_t) user_io_status_get(BLIT_OPT); 
     doScreensaver = (uint8_t) !user_io_status_get(SCREENSAVER_OPT); 
