@@ -118,6 +118,27 @@ GroovyMister::GroovyMister()
 	memset(&m_tickSync, 0, sizeof(m_tickSync));
 	memset(&m_tickCongestion, 0, sizeof(m_tickCongestion));
 
+#ifdef _WIN32
+	m_sockFD = INVALID_SOCKET;
+	m_sockInputsFD = INVALID_SOCKET;
+	memset(&m_rio, 0, sizeof(m_rio));
+	m_sendQueue = RIO_INVALID_CQ;
+	m_receiveQueue = RIO_INVALID_CQ;
+	m_requestQueue = RIO_INVALID_RQ;
+	m_hIOCP = NULL;
+	m_sendRioBufferId = RIO_INVALID_BUFFERID;
+	m_receiveRioBufferId = RIO_INVALID_BUFFERID;
+	m_sendRioBufferAudioId = RIO_INVALID_BUFFERID;
+	m_pBufsAudio = nullptr;
+	m_winsockStarted = false;
+	m_useRio = false;
+	for (int i = 0; i < 2; i++)
+	{
+		m_sendRioBufferBlitId[i] = RIO_INVALID_BUFFERID;
+		m_pBufsBlit[i] = nullptr;
+	}
+#endif
+
 	DWORD totalBufferCount = 0;
 	DWORD totalBufferSize = 0;
 	m_pBufferAudio = AllocateBufferSpace(BUFFER_SIZE, 1, totalBufferSize, totalBufferCount);
@@ -174,25 +195,76 @@ void GroovyMister::CmdClose(void)
 		Send(&m_bufferSend[0], 1);
 	}
 #ifdef _WIN32
-	if (USE_RIO)
+	if (m_useRio)
 	{
-		m_rio.RIOCloseCompletionQueue(m_sendQueue);
-		m_rio.RIOCloseCompletionQueue(m_receiveQueue);
-		m_rio.RIODeregisterBuffer(m_sendRioBufferId);
-		m_rio.RIODeregisterBuffer(m_sendRioBufferAudioId);
+		if (m_sendQueue != RIO_INVALID_CQ)
+		{
+			m_rio.RIOCloseCompletionQueue(m_sendQueue);
+			m_sendQueue = RIO_INVALID_CQ;
+		}
+		if (m_receiveQueue != RIO_INVALID_CQ)
+		{
+			m_rio.RIOCloseCompletionQueue(m_receiveQueue);
+			m_receiveQueue = RIO_INVALID_CQ;
+		}
+		if (m_sendRioBufferId != RIO_INVALID_BUFFERID)
+		{
+			m_rio.RIODeregisterBuffer(m_sendRioBufferId);
+			m_sendRioBufferId = RIO_INVALID_BUFFERID;
+		}
+		if (m_receiveRioBufferId != RIO_INVALID_BUFFERID)
+		{
+			m_rio.RIODeregisterBuffer(m_receiveRioBufferId);
+			m_receiveRioBufferId = RIO_INVALID_BUFFERID;
+		}
+		if (m_sendRioBufferAudioId != RIO_INVALID_BUFFERID)
+		{
+			m_rio.RIODeregisterBuffer(m_sendRioBufferAudioId);
+			m_sendRioBufferAudioId = RIO_INVALID_BUFFERID;
+		}
 		for (int i=0;i<2;i++)
 		{
-			m_rio.RIODeregisterBuffer(m_sendRioBufferBlitId[i]);
+			if (m_sendRioBufferBlitId[i] != RIO_INVALID_BUFFERID)
+			{
+				m_rio.RIODeregisterBuffer(m_sendRioBufferBlitId[i]);
+				m_sendRioBufferBlitId[i] = RIO_INVALID_BUFFERID;
+			}
 		}
 
 	}
-	::closesocket(m_sockFD);
-	::closesocket(m_sockInputsFD);
-	::WSACleanup();
+	if (m_hIOCP != NULL)
+	{
+		::CloseHandle(m_hIOCP);
+		m_hIOCP = NULL;
+	}
+	if (m_sockFD != INVALID_SOCKET)
+	{
+		::closesocket(m_sockFD);
+		m_sockFD = INVALID_SOCKET;
+	}
+	if (m_sockInputsFD != INVALID_SOCKET)
+	{
+		::closesocket(m_sockInputsFD);
+		m_sockInputsFD = INVALID_SOCKET;
+	}
+	if (m_winsockStarted)
+	{
+		::WSACleanup();
+		m_winsockStarted = false;
+	}
+	delete[] m_pBufsAudio;
+	m_pBufsAudio = nullptr;
+	for (int i = 0; i < 2; i++)
+	{
+		delete[] m_pBufsBlit[i];
+		m_pBufsBlit[i] = nullptr;
+	}
+	m_useRio = false;
 #else
 	close(m_sockFD);
 	close(m_sockInputsFD);
 #endif
+	m_isConnected = 0;
 }
 
 void GroovyMister::setVerbose(uint8_t sev)
@@ -219,23 +291,47 @@ int GroovyMister::CmdInit(const char* misterHost, uint16_t misterPort, int lz4Fr
 #ifdef _WIN32
 	WSADATA wsd;
 	uint16_t rc;
+	bool rioFallbackAvailable = (USE_RIO != 0);
+	bool usedRioFallback = false;
+	m_useRio = rioFallbackAvailable;
 
+	auto fallbackToStandardUdp = [&](const char* reason) -> bool
+	{
+		if (!m_useRio || !rioFallbackAvailable)
+		{
+			return false;
+		}
+
+		LOG(0, "[MiSTer] %s; retrying standard UDP.\n", reason);
+		CmdClose();
+		rioFallbackAvailable = false;
+		usedRioFallback = true;
+		m_useRio = false;
+		return true;
+	};
+
+retry_socket_init:
 	rc = ::WSAStartup(MAKEWORD(2, 2), &wsd);
 	if (rc != 0)
 	{
 		LOG(0, "[MiSTer] Unable to load Winsock: %d\n", rc);
 		return -1;
 	}
+	m_winsockStarted = true;
 
 	m_sockFD = INVALID_SOCKET;
 
-	if (USE_RIO)
+	if (m_useRio)
 	{
 		LOG(0, "[MiSTer] Initialising socket registered io %s...\n","");
 		m_sockFD = ::WSASocket(AF_INET, SOCK_DGRAM, IPPROTO_UDP, NULL, 0, WSA_FLAG_OVERLAPPED | WSA_FLAG_REGISTERED_IO);
 		if (m_sockFD == INVALID_SOCKET)
 		{
 			LOG(0,"[MiSTer] Could not create socket : %lu", ::GetLastError());
+			if (fallbackToStandardUdp("RIO socket setup failed"))
+			{
+				goto retry_socket_init;
+			}
 			return -1;
 		}
 
@@ -244,6 +340,10 @@ int GroovyMister::CmdInit(const char* misterHost, uint16_t misterPort, int lz4Fr
 		if (rc != 0)
 		{
 		        LOG(0,"[MiSTer] Could not create IP_DONTFRAGMENT : %lu", ::GetLastError());
+		        if (fallbackToStandardUdp("RIO socket option setup failed"))
+		        {
+			        goto retry_socket_init;
+		        }
 		        return -1;
 		}
 
@@ -253,6 +353,10 @@ int GroovyMister::CmdInit(const char* misterHost, uint16_t misterPort, int lz4Fr
 		if ( 0 != WSAIoctl(m_sockFD, SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER, &functionTableId, sizeof(GUID), (void**)&m_rio, sizeof(m_rio), &dwBytes, NULL, NULL) )
 		{
 			LOG(0,"[MiSTer] Could not create WSAIoctl : %lu", ::GetLastError());
+			if (fallbackToStandardUdp("RIO extension lookup failed"))
+			{
+				goto retry_socket_init;
+			}
 			return -1;
 		}
 
@@ -260,6 +364,10 @@ int GroovyMister::CmdInit(const char* misterHost, uint16_t misterPort, int lz4Fr
 		if (NULL == m_hIOCP)
 		{
 			LOG(0,"[MiSTer] Could not create m_hIOCP IoCompletionPort : %lu", ::GetLastError());
+			if (fallbackToStandardUdp("RIO completion port setup failed"))
+			{
+				goto retry_socket_init;
+			}
 			return -1;
 		}
 
@@ -278,21 +386,29 @@ int GroovyMister::CmdInit(const char* misterHost, uint16_t misterPort, int lz4Fr
 		if (m_sendRioBufferId == RIO_INVALID_BUFFERID)
 		{
 			LOG(0,"[MiSTer] RIORegisterBuffer m_BufferSend Error: %lu\n", ::GetLastError());
+			if (fallbackToStandardUdp("RIO buffer registration failed"))
+			{
+				goto retry_socket_init;
+			}
 			return -1;
 		}
 		m_sendRioBuffer.BufferId = m_sendRioBufferId;
 		m_sendRioBuffer.Offset = 0;
 		m_sendRioBuffer.Length = 26;
 
-		m_receiveRioBufferId = m_rio.RIORegisterBuffer(m_bufferReceive, 17);
+		m_receiveRioBufferId = m_rio.RIORegisterBuffer(m_bufferReceive, sizeof(m_bufferReceive));
 		if (m_receiveRioBufferId == RIO_INVALID_BUFFERID)
 		{
 			LOG(0,"[MiSTer] RIORegisterBuffer m_BufferReceive Error: %lu\n", ::GetLastError());
+			if (fallbackToStandardUdp("RIO buffer registration failed"))
+			{
+				goto retry_socket_init;
+			}
 			return -1;
 		}
 		m_receiveRioBuffer.BufferId = m_receiveRioBufferId;
 		m_receiveRioBuffer.Offset = 0;
-		m_receiveRioBuffer.Length = 17;
+		m_receiveRioBuffer.Length = sizeof(m_bufferReceive);
 		
 		DWORD offset = 0;
 		for (int field = 0; field < 2; field++)
@@ -308,6 +424,10 @@ int GroovyMister::CmdInit(const char* misterHost, uint16_t misterPort, int lz4Fr
 			if (m_sendRioBufferBlitId[field] == RIO_INVALID_BUFFERID)
 			{
 				LOG(0,"[MiSTer] RIORegisterBuffer pBufferBlit[%d] Error: %lu\n", field, ::GetLastError());
+				if (fallbackToStandardUdp("RIO buffer registration failed"))
+				{
+					goto retry_socket_init;
+				}
 				return -1;
 			}
 	
@@ -328,6 +448,10 @@ int GroovyMister::CmdInit(const char* misterHost, uint16_t misterPort, int lz4Fr
 		if (m_sendRioBufferAudioId == RIO_INVALID_BUFFERID)
 		{
 			LOG(0,"[MiSTer] RIORegisterBuffer pBufferAudio Error: %lu\n", ::GetLastError());
+			if (fallbackToStandardUdp("RIO buffer registration failed"))
+			{
+				goto retry_socket_init;
+			}
 			return -1;
 		}
 		offset = 0;
@@ -348,6 +472,10 @@ int GroovyMister::CmdInit(const char* misterHost, uint16_t misterPort, int lz4Fr
 		if (m_sendQueue == RIO_INVALID_CQ)
 		{
 			LOG(0,"[MiSTer]Could not create m_sendQueue : %lu", ::GetLastError());
+			if (fallbackToStandardUdp("RIO queue setup failed"))
+			{
+				goto retry_socket_init;
+			}
 			return -1;
 		}
 
@@ -355,6 +483,10 @@ int GroovyMister::CmdInit(const char* misterHost, uint16_t misterPort, int lz4Fr
 		if (m_receiveQueue == RIO_INVALID_CQ)
 		{
 			LOG(0,"[MiSTer]Could not create m_receiveQueue : %lu", ::GetLastError());
+			if (fallbackToStandardUdp("RIO queue setup failed"))
+			{
+				goto retry_socket_init;
+			}
 			return -1;
 		}
 
@@ -362,6 +494,10 @@ int GroovyMister::CmdInit(const char* misterHost, uint16_t misterPort, int lz4Fr
 		if (m_requestQueue == RIO_INVALID_RQ)
 		{
 			LOG(0,"[MiSTer]Could not create m_requestQueue : %lu", ::GetLastError());
+			if (fallbackToStandardUdp("RIO queue setup failed"))
+			{
+				goto retry_socket_init;
+			}
 			return -1;
 		}
 
@@ -369,6 +505,10 @@ int GroovyMister::CmdInit(const char* misterHost, uint16_t misterPort, int lz4Fr
 		if (SOCKET_ERROR == ::connect(m_sockFD, reinterpret_cast<sockaddr *>(&m_serverAddr), sizeof(m_serverAddr)))
 		{
 			LOG(0,"[MiSTer] Could not connect : %lu", ::GetLastError());
+			if (fallbackToStandardUdp("RIO connect failed"))
+			{
+				goto retry_socket_init;
+			}
 			return -1;
 		}
 
@@ -453,7 +593,7 @@ int GroovyMister::CmdInit(const char* misterHost, uint16_t misterPort, int lz4Fr
 	Send(&m_bufferSend[0], 5);
 
 #ifdef _WIN32
-	if (USE_RIO)
+	if (m_useRio)
 	{
 		m_rio.RIOReceive(m_requestQueue, &m_receiveRioBuffer, 1, 0, &m_receiveRioBuffer);
 	}
@@ -463,12 +603,24 @@ int GroovyMister::CmdInit(const char* misterHost, uint16_t misterPort, int lz4Fr
 	if (!ackTime)
 	{
 		LOG(0,"[MiSTer] ACK failed with %d ms\n", 60);
+	#ifdef _WIN32
+		if (fallbackToStandardUdp("RIO startup did not receive ACK"))
+		{
+			goto retry_socket_init;
+		}
+	#endif
 		CmdClose();
-		return -1;
+		return -23;
 	}
 	else
 	{
 		LOG(0,"[MiSTer] ACK received with %f ms\n", (double) ackTime / 10000);
+	#ifdef _WIN32
+		if (usedRioFallback)
+		{
+			LOG(0, "[MiSTer] Standard UDP startup succeeded after RIO fallback%s\n", "");
+		}
+	#endif
 		m_network_ping = 0;
 /*
 		for (int i=0; i<10; i++)
@@ -507,7 +659,7 @@ void GroovyMister::CmdSwitchres(double pClock, uint16_t hActive, uint16_t hBegin
 		m_RGBSize = m_RGBSize >> 1;
 	}
 
-	m_widthTime = 10 * round((double) hTotal * (1 / pClock)); //in nanosec, time to raster 1 line
+	m_widthTime = static_cast<uint32_t>(10 * round((double) hTotal * (1 / pClock))); //in nanosec, time to raster 1 line
 	m_frameTime = (m_widthTime * vTotal) >> interlace_modeline;
 	
 	m_interlace = interlace_modeline;
@@ -547,7 +699,8 @@ void GroovyMister::CmdBlit(uint32_t frame, uint8_t field, uint16_t vCountSync, u
 		else
 		{
 			uint32_t timeCalc = (m_network_ping + margin + m_emulationTime >= m_frameTime) ? 0 : m_network_ping + margin + m_emulationTime - m_streamTime;
-			vSync = (timeCalc == 0) ? 1 : m_vTotal - round(m_vTotal * timeCalc) / m_frameTime;
+			uint32_t vSyncCalc = (timeCalc == 0) ? 1 : m_vTotal - static_cast<uint32_t>(round(m_vTotal * timeCalc) / m_frameTime);
+			vSync = static_cast<uint16_t>(vSyncCalc);
 		}
 	}
 
@@ -692,7 +845,7 @@ uint32_t GroovyMister::getACK(DWORD dwMilliseconds)
 		setTimeStart();
 	}
 #ifdef _WIN32
-	if (USE_RIO)
+	if (m_useRio)
 	{
 		static const DWORD RIO_MAX_RESULTS = 1000;
 		DWORD numberOfBytes = 0;
@@ -739,7 +892,7 @@ uint32_t GroovyMister::getACK(DWORD dwMilliseconds)
 						memcpy(&m_core_version, &m_bufferReceive[0], 1);
 					}
 					idx++;
-				} while (idx <= numResults);
+				} while (idx < numResults);
 				numResults = m_rio.RIODequeueCompletion(m_receiveQueue, results, numResults);
 			}
 			m_rio.RIOReceive(m_requestQueue, &m_receiveRioBuffer, 1, 0, &m_receiveRioBuffer);
@@ -982,7 +1135,7 @@ char *GroovyMister::AllocateBufferSpace(const DWORD bufSize, const DWORD bufCoun
 void GroovyMister::Send(void *cmd, int cmdSize)
 {
 #ifdef _WIN32
-if (USE_RIO)
+if (m_useRio)
 {
 	m_sendRioBuffer.Length = cmdSize;
 	m_rio.RIOSend(m_requestQueue, &m_sendRioBuffer, 1, RIO_MSG_DONT_NOTIFY, &m_sendRioBuffer);
@@ -996,7 +1149,7 @@ void GroovyMister::SendStream(uint8_t whichBuffer, uint8_t field, uint32_t bytes
 {	
 	uint32_t bytesSended = 0;
 #ifdef _WIN32
-if (USE_RIO)
+if (m_useRio)
 {
 	DWORD flags = RIO_MSG_DONT_NOTIFY | RIO_MSG_DEFER;
 	int i=0;
@@ -1062,7 +1215,7 @@ inline void GroovyMister::setTimeEnd(void)
 uint32_t GroovyMister::DiffTime(void)
 {
 #ifdef _WIN32
-	return m_tickEnd.QuadPart - m_tickStart.QuadPart;
+	return static_cast<uint32_t>(m_tickEnd.QuadPart - m_tickStart.QuadPart);
 #else
 	uint32_t diffTime = 0;
 	timespec temp;

@@ -4,6 +4,9 @@
 #include <inttypes.h>
 
 #ifdef _WIN32
+ #ifndef NOMINMAX
+  #define NOMINMAX
+ #endif
  #include <winsock2.h>
  #include <ws2tcpip.h>
  #include <mswsock.h>
@@ -146,6 +149,8 @@ class GroovyMister
 	RIO_BUF m_sendRioBufferAudio;
 	RIO_BUF *m_pBufsAudio;
 	SOCKET m_sockInputsFD;
+	bool m_winsockStarted;
+	bool m_useRio;
 
 	LARGE_INTEGER m_tickStart;
 	LARGE_INTEGER m_tickEnd;
