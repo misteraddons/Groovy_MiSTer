@@ -62,6 +62,25 @@ try {
     }
     Assert-True ($groovy -match '\(\s*sev\s*==\s*0\s*\|\|\s*sev\s*<=\s*doVerbose\s*\)') "LOG must always write severity 0 startup/error lines to the log file"
 
+    $groovyTop = Read-Text "Groovy.sv"
+    Assert-True ($groovyTop -match [regex]::Escape("inout  [45:0] HPS_BUS")) "Groovy.sv must use the current 46-bit framework HPS_BUS"
+    Assert-True ($groovyTop -match [regex]::Escape("output        HDMI_BOB_DEINT")) "Groovy.sv must expose the current framework HDMI_BOB_DEINT port"
+    Assert-True ($groovyTop -match [regex]::Escape("assign HDMI_BOB_DEINT = 0;")) "Groovy.sv must default HDMI_BOB_DEINT low"
+
+    $hpsIo = Read-Text "sys/hps_io.sv"
+    Assert-True ($hpsIo -match [regex]::Escape("inout      [45:0] HPS_BUS")) "hps_io.sv must use the current 46-bit framework HPS_BUS"
+    Assert-True ($hpsIo -notmatch [regex]::Escape("HPS_BUS[48:46]")) "hps_io.sv still references removed framework capability bits"
+    Assert-True ($hpsIo -match [regex]::Escape("{ioctl_rd, skip_add} <= req_io;")) "hps_io.sv is missing the current upload read handshake fix"
+
+    Assert-True (Test-Path -LiteralPath "sys/emu_ports.vh") "Missing current framework emu_ports.vh include file"
+    Assert-True (Test-Path -LiteralPath "sys/audio_out.sv") "Missing current SystemVerilog audio_out.sv"
+    Assert-True (-not (Test-Path -LiteralPath "sys/audio_out.v")) "Obsolete sys/audio_out.v still exists"
+    $ascal = Read-Text "sys/ascal.vhd"
+    Assert-True ($ascal -match [regex]::Escape("bob_deint : IN std_logic := '0';")) "ascal.vhd must expose the current framework bob_deint port"
+    $sysQip = Read-Text "sys/sys.qip"
+    Assert-True ($sysQip -match [regex]::Escape("audio_out.sv")) "sys.qip must reference audio_out.sv"
+    Assert-True ($sysQip -match [regex]::Escape("emu_ports.vh")) "sys.qip must include emu_ports.vh as a source file"
+
     $gitignore = Read-Text ".gitignore"
     foreach ($pattern in @("*.o", "*.d", "*.elf", "*.ll", "/build/", "dist/", "Main_MiSTer/")) {
         Assert-True ($gitignore -match [regex]::Escape($pattern)) ".gitignore is missing $pattern"

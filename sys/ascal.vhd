@@ -204,6 +204,7 @@ ENTITY ascal IS
 		run    : IN std_logic :='1'; -- 1=Enable output image. 0=No image
 		freeze : IN std_logic :='0'; -- 1=Disable framebuffer writes
 		mode   : IN unsigned(4 DOWNTO 0);
+		bob_deint : IN std_logic := '0';
 		-- SYNC  |_________________________/"""""""""\_______|
 		-- DE    |""""""""""""""""""\________________________|
 		-- RGB   |    <#IMAGE#>      ^HDISP                  |
