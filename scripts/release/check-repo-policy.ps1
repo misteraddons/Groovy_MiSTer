@@ -119,7 +119,7 @@ try {
     foreach ($artifact in @("Groovy.rbf", "MiSTer_groovy", "MiSTer_groovy_XDP", "groovy_xdp_kern.o", "libelf.so.1")) {
         Assert-True ($stageRelease -match [regex]::Escape($artifact)) "Release staging script does not mention $artifact"
     }
-    Assert-True ($stageRelease -match [regex]::Escape("build/hps-src/MiSTer_groovy")) "Release staging script must read prepared HPS build outputs"
+    Assert-True ($stageRelease -match [regex]::Escape("build/hps-src/bin/MiSTer_groovy")) "Release staging script must read prepared HPS build outputs"
 
     Write-Host "Repository policy checks passed."
 }

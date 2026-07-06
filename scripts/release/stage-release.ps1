@@ -25,6 +25,7 @@ $artifacts = @(
         Name = "MiSTer_groovy"
         OutputName = "MiSTer_groovy"
         Candidates = @(
+            "build/hps-src/bin/MiSTer_groovy",
             "build/hps-src/MiSTer_groovy",
             "hps_linux/src/MiSTer_groovy",
             "hps_linux/MiSTer_groovy"
@@ -34,6 +35,7 @@ $artifacts = @(
         Name = "MiSTer_groovy_XDP"
         OutputName = "MiSTer_groovy_XDP"
         Candidates = @(
+            "build/hps-src/bin/MiSTer_groovy_XDP",
             "build/hps-src/MiSTer_groovy_XDP",
             "hps_linux/src/MiSTer_groovy_XDP",
             "hps_linux/MiSTer_groovy_XDP"
