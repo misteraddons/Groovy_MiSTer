@@ -111,7 +111,7 @@ typedef struct MODULE_API_GMW{
 /* Declaration of the wrapper functions */
 
 // Init streaming with ip, port, (lz4frames = 0-raw, 1-lz4, 2-lz4hc, 3-lz4 adaptative), soundRate(1-22k, 2-44.1, 3-48 khz), soundChan(1 or 2), rgbMode(0-RGB888, 1-RGBA888, 2-RGB565), mtu source
-MODULE_API_GMW void gmw_init(const char* misterHost, uint8_t lz4Frames, uint32_t soundRate, uint8_t soundChan, uint8_t rgbMode, uint16_t mtu);
+MODULE_API_GMW int gmw_init(const char* misterHost, uint8_t lz4Frames, uint32_t soundRate, uint8_t soundChan, uint8_t rgbMode, uint16_t mtu);
 // Close stream
 MODULE_API_GMW void gmw_close(void);
 // Change resolution (check https://github.com/antonioginer/switchres) for modeline generation (interlace=2 for progressive framebuffer)

@@ -9,6 +9,8 @@
  **************************************************************/
 
 #define MODULE_API_EXPORTS_GMW
+#include <cstdio>
+#include <cstring>
 #include "groovymister.h"
 #include "groovymister_wrapper.h"
 #ifdef __cplusplus
@@ -19,14 +21,14 @@ extern "C" {
 GroovyMister* gmw;
 int gmw_inputsBinded;
 
-MODULE_API_GMW void gmw_init(const char* misterHost, uint8_t lz4Frames, uint32_t soundRate, uint8_t soundChan, uint8_t rgbMode, uint16_t mtu)
+MODULE_API_GMW int gmw_init(const char* misterHost, uint8_t lz4Frames, uint32_t soundRate, uint8_t soundChan, uint8_t rgbMode, uint16_t mtu)
 {
 	if (gmw == NULL)
 	{
 		gmw = new GroovyMister;
 		gmw_inputsBinded = 0;
 	}
-	gmw->CmdInit(misterHost, 32100, lz4Frames, soundRate, soundChan, rgbMode, mtu);
+	return gmw->CmdInit(misterHost, 32100, lz4Frames, soundRate, soundChan, rgbMode, mtu);
 }
 
 MODULE_API_GMW void gmw_close(void)

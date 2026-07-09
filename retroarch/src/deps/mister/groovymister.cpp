@@ -103,10 +103,36 @@ GroovyMister::GroovyMister()
 	m_streamTime = 0;
 	m_emulationTime = 0;
 	m_mtu = 0;
+	m_isConnected = 0;
+	m_modeConfigured = 0;
+	memset(m_bufferSend, 0, sizeof(m_bufferSend));
+	memset(m_bufferReceive, 0, sizeof(m_bufferReceive));
+	memset(m_bufferInputsReceive, 0, sizeof(m_bufferInputsReceive));
 
 	memset(&m_tickStart, 0, sizeof(m_tickStart));
 	memset(&m_tickEnd, 0, sizeof(m_tickEnd));
 	memset(&m_tickSync, 0, sizeof(m_tickSync));
+
+#ifdef _WIN32
+	m_sockFD = INVALID_SOCKET;
+	m_sockInputsFD = INVALID_SOCKET;
+	m_sendQueue = RIO_INVALID_CQ;
+	m_receiveQueue = RIO_INVALID_CQ;
+	m_requestQueue = RIO_INVALID_RQ;
+	m_hIOCP = NULL;
+	ZeroMemory(&m_overlapped, sizeof(m_overlapped));
+	m_sendRioBufferId = RIO_INVALID_BUFFERID;
+	m_receiveRioBufferId = RIO_INVALID_BUFFERID;
+	m_sendRioBufferBlitId = RIO_INVALID_BUFFERID;
+	m_sendRioBufferAudioId = RIO_INVALID_BUFFERID;
+	m_pBufsBlit = nullptr;
+	m_pBufsAudio = nullptr;
+	m_winsockStarted = false;
+	m_useRio = false;
+#else
+	m_sockFD = -1;
+	m_sockInputsFD = -1;
+#endif
 
 	DWORD totalBufferCount = 0;
 	DWORD totalBufferSize = 0;
@@ -118,6 +144,7 @@ GroovyMister::GroovyMister()
 
 GroovyMister::~GroovyMister()
 {
+	CmdClose();
 #ifdef _WIN32
 	VirtualFree(pBufferBlit, 0, MEM_RELEASE);
 	VirtualFree(pBufferAudio, 0, MEM_RELEASE);
@@ -131,24 +158,49 @@ GroovyMister::~GroovyMister()
 
 void GroovyMister::CmdClose(void)
 {
-	m_bufferSend[0] = CMD_CLOSE;
-	Send(&m_bufferSend[0], 1);
-#ifdef _WIN32
-	if (USE_RIO)
+	if (m_isConnected)
 	{
-		m_rio.RIOCloseCompletionQueue(m_sendQueue);
-		m_rio.RIOCloseCompletionQueue(m_receiveQueue);
-		m_rio.RIODeregisterBuffer(m_sendRioBufferId);
-		m_rio.RIODeregisterBuffer(m_sendRioBufferBlitId);
-		m_rio.RIODeregisterBuffer(m_sendRioBufferAudioId);
+		m_bufferSend[0] = CMD_CLOSE;
+		Send(&m_bufferSend[0], 1);
 	}
-	::closesocket(m_sockFD);
-	::closesocket(m_sockInputsFD);
-	::WSACleanup();
+#ifdef _WIN32
+	if (m_useRio)
+	{
+		if (m_sendQueue != RIO_INVALID_CQ) m_rio.RIOCloseCompletionQueue(m_sendQueue);
+		if (m_receiveQueue != RIO_INVALID_CQ) m_rio.RIOCloseCompletionQueue(m_receiveQueue);
+		if (m_sendRioBufferId != RIO_INVALID_BUFFERID) m_rio.RIODeregisterBuffer(m_sendRioBufferId);
+		if (m_receiveRioBufferId != RIO_INVALID_BUFFERID) m_rio.RIODeregisterBuffer(m_receiveRioBufferId);
+		if (m_sendRioBufferBlitId != RIO_INVALID_BUFFERID) m_rio.RIODeregisterBuffer(m_sendRioBufferBlitId);
+		if (m_sendRioBufferAudioId != RIO_INVALID_BUFFERID) m_rio.RIODeregisterBuffer(m_sendRioBufferAudioId);
+	}
+	if (m_hIOCP != NULL) ::CloseHandle(m_hIOCP);
+	if (m_sockFD != INVALID_SOCKET) ::closesocket(m_sockFD);
+	if (m_sockInputsFD != INVALID_SOCKET) ::closesocket(m_sockInputsFD);
+	if (m_winsockStarted) ::WSACleanup();
+	delete[] m_pBufsBlit;
+	delete[] m_pBufsAudio;
+	m_sockFD = INVALID_SOCKET;
+	m_sockInputsFD = INVALID_SOCKET;
+	m_sendQueue = RIO_INVALID_CQ;
+	m_receiveQueue = RIO_INVALID_CQ;
+	m_requestQueue = RIO_INVALID_RQ;
+	m_hIOCP = NULL;
+	m_sendRioBufferId = RIO_INVALID_BUFFERID;
+	m_receiveRioBufferId = RIO_INVALID_BUFFERID;
+	m_sendRioBufferBlitId = RIO_INVALID_BUFFERID;
+	m_sendRioBufferAudioId = RIO_INVALID_BUFFERID;
+	m_pBufsBlit = nullptr;
+	m_pBufsAudio = nullptr;
+	m_winsockStarted = false;
+	m_useRio = false;
 #else
-	close(m_sockFD);
-	close(m_sockInputsFD);
+	if (m_sockFD >= 0) close(m_sockFD);
+	if (m_sockInputsFD >= 0) close(m_sockInputsFD);
+	m_sockFD = -1;
+	m_sockInputsFD = -1;
 #endif
+	m_isConnected = 0;
+	m_modeConfigured = 0;
 }
 
 void GroovyMister::setVerbose(uint8_t sev)
@@ -161,25 +213,42 @@ const char* GroovyMister::getVersion()
 	return &GROOVYMISTER_VERSION[0];
 }
 
-uint8_t GroovyMister::CmdInit(const char* misterHost, uint16_t misterPort, uint8_t lz4Frames, uint32_t soundRate, uint8_t soundChan, uint8_t rgbMode, uint16_t mtu)
+int GroovyMister::CmdInit(const char* misterHost, uint16_t misterPort, uint8_t lz4Frames, uint32_t soundRate, uint8_t soundChan, uint8_t rgbMode, uint16_t mtu)
 {
+	if (!misterHost || !misterHost[0] || misterPort == 0 || lz4Frames > 3 ||
+		(soundRate != 0 && soundRate != 22050 && soundRate != 44100 && soundRate != 48000) ||
+		soundChan > 2 || rgbMode > 2 || (mtu != 0 && mtu != 1500 && mtu != 3800) ||
+		!pBufferBlit || !pBufferAudio || !m_pBufferLZ4)
+	{
+		return -2;
+	}
+
+	CmdClose();
 	m_mtu = (!mtu) ? BUFFER_MTU : mtu - MTU_HEADER;
+	m_modeConfigured = 0;
 	
 	// Set server
 	m_serverAddr.sin_family = AF_INET;
 	m_serverAddr.sin_port = htons(misterPort);
 	m_serverAddr.sin_addr.s_addr = inet_addr(misterHost);
+	if (m_serverAddr.sin_addr.s_addr == INADDR_NONE)
+	{
+		return -2;
+	}
 
 	// Set socket
 #ifdef _WIN32
 	WSADATA wsd;
-	uint16_t rc;
+	int rc;
 
 	rc = ::WSAStartup(MAKEWORD(2, 2), &wsd);
 	if (rc != 0)
 	{
 		LOG(0, "[MiSTer] Unable to load Winsock: %d\n", rc);
+		return -1;
 	}
+	m_winsockStarted = true;
+	m_useRio = false;
 
 	m_sockFD = INVALID_SOCKET;
 
@@ -190,6 +259,8 @@ uint8_t GroovyMister::CmdInit(const char* misterHost, uint16_t misterPort, uint8
 		if (m_sockFD == INVALID_SOCKET)
 		{
 			LOG(0,"[MiSTer] Could not create socket : %lu", ::GetLastError());
+			CmdClose();
+			return -1;
 		}	        
    
 		DWORD val = 1;
@@ -197,6 +268,8 @@ uint8_t GroovyMister::CmdInit(const char* misterHost, uint16_t misterPort, uint8
 		if (rc != 0)
 		{
 		        LOG(0,"[MiSTer] Could not create IP_DONTFRAGMENT : %lu", ::GetLastError());
+			CmdClose();
+			return -1;
 		}   		
  	
 		LOG(0,"[MiSTer] Setting WSAIoctl %s...\n","");
@@ -205,42 +278,50 @@ uint8_t GroovyMister::CmdInit(const char* misterHost, uint16_t misterPort, uint8
 		if ( 0 != WSAIoctl(m_sockFD, SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER, &functionTableId, sizeof(GUID), (void**)&m_rio, sizeof(m_rio), &dwBytes, NULL, NULL) )
 		{
 			LOG(0,"[MiSTer] Could not create WSAIoctl : %lu", ::GetLastError());
+			CmdClose();
+			return -1;
 		}
+		m_useRio = true;
 
 		m_hIOCP = ::CreateIoCompletionPort(INVALID_HANDLE_VALUE, 0, 0, 0) ;
 		if (NULL == m_hIOCP)
 		{
 			LOG(0,"[MiSTer] Could not create m_hIOCP IoCompletionPort : %lu", ::GetLastError());
+			CmdClose();
+			return -1;
 		}		
 
-		OVERLAPPED overlapped;
-			ZeroMemory(&overlapped, sizeof(overlapped));
+		ZeroMemory(&m_overlapped, sizeof(m_overlapped));
 
 		RIO_NOTIFICATION_COMPLETION completionType ;
 
 		completionType.Type = RIO_IOCP_COMPLETION;
 		completionType.Iocp.IocpHandle = m_hIOCP;
 		completionType.Iocp.CompletionKey = (void*)1;
-		completionType.Iocp.Overlapped = &overlapped;
+		completionType.Iocp.Overlapped = &m_overlapped;
 
 		LOG(0,"[MiSTer] Register Buffers %s...\n","");
 		m_sendRioBufferId = m_rio.RIORegisterBuffer(m_bufferSend, 26);
 		if (m_sendRioBufferId == RIO_INVALID_BUFFERID)
 		{
 			LOG(0,"[MiSTer] RIORegisterBuffer m_BufferSend Error: %lu\n", ::GetLastError());
+			CmdClose();
+			return -1;
 		}
 		m_sendRioBuffer.BufferId = m_sendRioBufferId;
 		m_sendRioBuffer.Offset = 0;
 		m_sendRioBuffer.Length = 26;
 
-		m_receiveRioBufferId = m_rio.RIORegisterBuffer(m_bufferReceive, 17);
+		m_receiveRioBufferId = m_rio.RIORegisterBuffer(m_bufferReceive, sizeof(m_bufferReceive));
 		if (m_receiveRioBufferId == RIO_INVALID_BUFFERID)
 		{
 			LOG(0,"[MiSTer] RIORegisterBuffer m_BufferReceive Error: %lu\n", ::GetLastError());
+			CmdClose();
+			return -1;
 		}
 		m_receiveRioBuffer.BufferId = m_receiveRioBufferId;
 		m_receiveRioBuffer.Offset = 0;
-		m_receiveRioBuffer.Length = 17;
+		m_receiveRioBuffer.Length = sizeof(m_bufferReceive);
 
 		if (lz4Frames)
 		{
@@ -253,6 +334,8 @@ uint8_t GroovyMister::CmdInit(const char* misterHost, uint16_t misterPort, uint8
 		if (m_sendRioBufferBlitId == RIO_INVALID_BUFFERID)
 		{
 			LOG(0,"[MiSTer] RIORegisterBuffer pBufferBlit Error: %lu\n", ::GetLastError());
+			CmdClose();
+			return -1;
 		}
 
 		DWORD offset = 0;
@@ -263,15 +346,18 @@ uint8_t GroovyMister::CmdInit(const char* misterHost, uint16_t misterPort, uint8
 
 			pBuffer->BufferId = m_sendRioBufferBlitId;
 			pBuffer->Offset = offset;
-			pBuffer->Length = m_mtu;
+			pBuffer->Length = (offset < BUFFER_SIZE) ?
+				((BUFFER_SIZE - offset < m_mtu) ? BUFFER_SIZE - offset : m_mtu) : 0;
 
-			offset += m_mtu;
+			offset += pBuffer->Length;
 		}
 
 		m_sendRioBufferAudioId = m_rio.RIORegisterBuffer(pBufferAudio, BUFFER_SIZE);
 		if (m_sendRioBufferAudioId == RIO_INVALID_BUFFERID)
 		{
 			LOG(0,"[MiSTer] RIORegisterBuffer pBufferAudio Error: %lu\n", ::GetLastError());
+			CmdClose();
+			return -1;
 		}
 		offset = 0;
 		m_pBufsAudio = new RIO_BUF[BUFFER_SLICES];
@@ -281,9 +367,10 @@ uint8_t GroovyMister::CmdInit(const char* misterHost, uint16_t misterPort, uint8
 
 			pBuffer->BufferId = m_sendRioBufferAudioId;
 			pBuffer->Offset = offset;
-			pBuffer->Length = m_mtu;
+			pBuffer->Length = (offset < BUFFER_SIZE) ?
+				((BUFFER_SIZE - offset < m_mtu) ? BUFFER_SIZE - offset : m_mtu) : 0;
 
-			offset += m_mtu;
+			offset += pBuffer->Length;
 		}
 
 		LOG(0,"[MiSTer] Create queues %s...\n","");
@@ -291,24 +378,32 @@ uint8_t GroovyMister::CmdInit(const char* misterHost, uint16_t misterPort, uint8
 		if (m_sendQueue == RIO_INVALID_CQ)
 		{
 			LOG(0,"[MiSTer]Could not create m_sendQueue : %lu", ::GetLastError());
+			CmdClose();
+			return -1;
 		}
 
 		m_receiveQueue = m_rio.RIOCreateCompletionQueue(BUFFER_SLICES, &completionType);
 		if (m_receiveQueue == RIO_INVALID_CQ)
 		{
 			LOG(0,"[MiSTer]Could not create m_receiveQueue : %lu", ::GetLastError());
+			CmdClose();
+			return -1;
 		}
 
 		m_requestQueue = m_rio.RIOCreateRequestQueue(m_sockFD, BUFFER_SLICES, 1, BUFFER_SLICES, 1, m_receiveQueue, m_sendQueue, NULL) ;
 		if (m_requestQueue == RIO_INVALID_RQ)
 		{
 			LOG(0,"[MiSTer]Could not create m_requestQueue : %lu", ::GetLastError());
+			CmdClose();
+			return -1;
 		}
 
 		LOG(0,"[MiSTer] Connect %s...\n","");
 		if (SOCKET_ERROR == ::connect(m_sockFD, reinterpret_cast<sockaddr *>(&m_serverAddr), sizeof(m_serverAddr)))
 		{
 			LOG(0,"[MiSTer] Could not connect : %lu", ::GetLastError());
+			CmdClose();
+			return -1;
 		}
 
 		m_rio.RIONotify(m_receiveQueue);
@@ -343,23 +438,28 @@ uint8_t GroovyMister::CmdInit(const char* misterHost, uint16_t misterPort, uint8
 #else
 	printf("[DEBUG] Initialising socket...\n");
 	m_sockFD = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-	if (sockfd < 0)
+	if (m_sockFD < 0)
 	{
-		LOG(0,"[MiSTer] Could not create socket : %d", sockfd);
+		LOG(0,"[MiSTer] Could not create socket : %d", m_sockFD);
+		return -1;
 	}
 
 	LOG(0,"[MiSTer] Setting socket async %s...\n","");
 	// Non blocking socket
 	int flags;
-	flags = fcntl(m_sockFD, F_GETFD, 0);
+	flags = fcntl(m_sockFD, F_GETFL, 0);
 	if (flags < 0)
 	{
 		LOG(0,"[MiSTer] get falg error %d\n", flags);
+		CmdClose();
+		return -1;
 	}
 	flags |= O_NONBLOCK;
 	if (fcntl(m_sockFD, F_SETFL, flags) < 0)
 	{
 		LOG(0,"[MiSTer] set nonblock fail %d\n", flags);
+		CmdClose();
+		return -1;
 	}
 
 	printf("[DEBUG] Setting send buffer to 2097152 bytes...\n");
@@ -367,6 +467,8 @@ uint8_t GroovyMister::CmdInit(const char* misterHost, uint16_t misterPort, uint8
 	if (setsockopt(m_sockFD, SOL_SOCKET, SO_SNDBUF, (void*)&size, sizeof(size)) < 0)
 	{
 		LOG(0,"[MiSTer] Unable to set send buffer: %d\n", 2097152);
+		CmdClose();
+		return -1;
 	}
 #endif
 
@@ -396,26 +498,37 @@ uint8_t GroovyMister::CmdInit(const char* misterHost, uint16_t misterPort, uint8
 	{
 		LOG(0,"[MiSTer] ACK failed with %d ms\n", 60);
 		CmdClose();
-		return 0;
+		return -23;
 	}
 	else
 	{
 		LOG(0,"[MiSTer] ACK received with %f ms\n", (double) ackTime / 10000);
-		return 1;
+		m_isConnected = 1;
+		return 0;
 	}
 
 }
 
 void GroovyMister::CmdSwitchres(double pClock, uint16_t hActive, uint16_t hBegin, uint16_t hEnd, uint16_t hTotal, uint16_t vActive, uint16_t vBegin, uint16_t vEnd, uint16_t vTotal, uint8_t interlace)
 {
+	m_modeConfigured = 0;
+	const bool horizontalValid = hActive > 0 && hActive <= MAX_FRAME_WIDTH && hActive <= hBegin &&
+		hBegin <= hEnd && hEnd <= hTotal && hTotal > hActive && hBegin - hActive <= UINT8_MAX &&
+		hEnd - hBegin <= UINT8_MAX && hTotal - hEnd <= UINT8_MAX;
+	const bool verticalValid = vActive > 0 && vActive <= MAX_FRAME_HEIGHT && vActive <= vBegin &&
+		vBegin <= vEnd && vEnd <= vTotal && vTotal > vActive && vBegin - vActive <= UINT8_MAX &&
+		vEnd - vBegin <= UINT8_MAX && vTotal - vEnd <= UINT8_MAX;
+	uint64_t rgbSize = (uint64_t)hActive * vActive * ((m_rgbMode == 1) ? 4 : (m_rgbMode == 2) ? 2 : 3);
+	if (interlace == 1) rgbSize >>= 1;
+	if (!m_isConnected || !isfinite(pClock) || pClock <= 0.0 || !horizontalValid || !verticalValid ||
+		interlace > 2 || rgbSize == 0 || rgbSize > BUFFER_SIZE)
+	{
+		return;
+	}
+
 	uint8_t interlace_modeline = (interlace != 2) ? interlace : 1;
 
-	m_RGBSize = (m_rgbMode == 1) ? (hActive * vActive) << 2 : (m_rgbMode == 2) ? (hActive * vActive) << 1 : hActive * vActive * 3;
-
-	if (interlace == 1)
-	{
-		m_RGBSize = m_RGBSize >> 1;
-	}
+	m_RGBSize = (uint32_t)rgbSize;
 
 	m_widthTime = 10 * round((double) hTotal * (1 / pClock)); //in nanosec, time to raster 1 line
 	m_frameTime = (m_widthTime * vTotal) >> interlace_modeline;
@@ -435,10 +548,16 @@ void GroovyMister::CmdSwitchres(double pClock, uint16_t hActive, uint16_t hBegin
 	memcpy(&m_bufferSend[25],&interlace,sizeof(interlace));
 
 	Send(&m_bufferSend[0], 26);
+	m_modeConfigured = 1;
 }
 
 void GroovyMister::CmdBlit(uint32_t frame, uint16_t vCountSync, uint32_t margin)
 {
+	if (!m_isConnected || !m_modeConfigured || m_RGBSize == 0 || m_RGBSize > BUFFER_SIZE || m_frameTime == 0)
+	{
+		return;
+	}
+
 	m_frame = frame;
 	uint16_t vSync = vCountSync;
 
@@ -473,6 +592,10 @@ void GroovyMister::CmdBlit(uint32_t frame, uint16_t vCountSync, uint32_t margin)
 		m_lz4Frames = 2;
 		LOG(0,"[MiSTer] LZ4 Adaptative apply LZ4HC on frame %d\n", frame);
 	}
+	if (m_lz4Frames && cSize == 0)
+	{
+		return;
+	}
 
 	m_bufferSend[0] = CMD_BLIT_VSYNC;
 	memcpy(&m_bufferSend[1], &frame, sizeof(frame));
@@ -498,7 +621,7 @@ void GroovyMister::CmdBlit(uint32_t frame, uint16_t vCountSync, uint32_t margin)
 
 void GroovyMister::CmdAudio(uint16_t soundSize)
 {
-	if (!fpga.audio)
+	if (!fpga.audio || !m_isConnected || soundSize == 0 || soundSize > AUDIO_BUFFER_SIZE)
 	{
 		return;
 	}
@@ -645,6 +768,11 @@ int GroovyMister::DiffTimeRaster(void)
 
 void GroovyMister::BindInputs(const char* misterHost, uint16_t misterPort)
 {
+	if (!misterHost || !misterHost[0] || misterPort == 0)
+	{
+		return;
+	}
+
 	// Set server
 	m_serverAddrInputs.sin_family = AF_INET;
 	m_serverAddrInputs.sin_port = htons(misterPort);
@@ -652,11 +780,16 @@ void GroovyMister::BindInputs(const char* misterHost, uint16_t misterPort)
 	// Set socket
 #ifdef _WIN32
 	WSADATA wsd;
-	uint16_t rc;
-	rc = ::WSAStartup(MAKEWORD(2, 2), &wsd);
-	if (rc != 0)
+	int rc = 0;
+	if (!m_winsockStarted)
 	{
-		LOG(0, "[MiSTer][Inputs] Unable to load Winsock: %d\n", rc);
+		rc = ::WSAStartup(MAKEWORD(2, 2), &wsd);
+		if (rc != 0)
+		{
+			LOG(0, "[MiSTer][Inputs] Unable to load Winsock: %d\n", rc);
+			return;
+		}
+		m_winsockStarted = true;
 	}
 	m_sockInputsFD = INVALID_SOCKET;
 	LOG(0, "[MiSTer][Inputs] Initialising socket %s...\n","");
@@ -664,6 +797,7 @@ void GroovyMister::BindInputs(const char* misterHost, uint16_t misterPort)
 	if (m_sockInputsFD == INVALID_SOCKET)
 	{
 		LOG(0,"[MiSTer][Inputs] Could not create socket : %lu", ::GetLastError());
+		return;
 	}
 	LOG(0,"[MiSTer][Inputs] Setting socket async %s...\n","");
 	u_long iMode=1;
@@ -671,6 +805,9 @@ void GroovyMister::BindInputs(const char* misterHost, uint16_t misterPort)
 	if (rc < 0)
 	{
 		LOG(0,"[MiSTer][Inputs] set nonblock fail %d\n", rc);
+		::closesocket(m_sockInputsFD);
+		m_sockInputsFD = INVALID_SOCKET;
+		return;
 	}
 	LOG(0,"[MiSTer][Inputs] Binding port %s...\n","");
 		sendto(m_sockInputsFD, m_bufferSend, 1, 0, (struct sockaddr *)&m_serverAddrInputs, sizeof(m_serverAddrInputs));
@@ -680,20 +817,27 @@ void GroovyMister::BindInputs(const char* misterHost, uint16_t misterPort)
 	m_sockInputsFD = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 	if (m_sockInputsFD < 0)
 	{
-		LOG(0,"[MiSTer][Inputs] Could not create socket : %d", sockfd);
+		LOG(0,"[MiSTer][Inputs] Could not create socket : %d", m_sockInputsFD);
+		return;
 	}
 	LOG(0,"[MiSTer][Input] Setting socket async %s...\n","");
 	// Non blocking socket
 	int flags;
-	flags = fcntl(m_sockInputsFD, F_GETFD, 0);
+	flags = fcntl(m_sockInputsFD, F_GETFL, 0);
 	if (flags < 0)
 	{
 		LOG(0,"[MiSTer][Inputs] get falg error %d\n", flags);
+		close(m_sockInputsFD);
+		m_sockInputsFD = -1;
+		return;
 	}
 	flags |= O_NONBLOCK;
 	if (fcntl(m_sockInputsFD, F_SETFL, flags) < 0)
 	{
 		LOG(0,"[MiSTer] set nonblock fail %d\n", flags);
+		close(m_sockInputsFD);
+		m_sockInputsFD = -1;
+		return;
 	}
 	LOG(0,"[MiSTer][Inputs] Binding port %s...\n","");
 	sendto(m_sockInputsFD, m_bufferSend, 1, 0, (struct sockaddr *)&m_serverAddrInputs, sizeof(m_serverAddrInputs));
@@ -702,6 +846,15 @@ void GroovyMister::BindInputs(const char* misterHost, uint16_t misterPort)
 
 void GroovyMister::PollInputs(void)
 {
+#ifdef _WIN32
+	if (m_sockInputsFD == INVALID_SOCKET)
+#else
+	if (m_sockInputsFD < 0)
+#endif
+	{
+		return;
+	}
+
 	uint32_t joyFrame = joyInputs.joyFrame;
 	uint8_t  joyOrder = joyInputs.joyOrder;
 	uint32_t ps2Frame = ps2Inputs.ps2Frame;
@@ -779,8 +932,9 @@ char *GroovyMister::AllocateBufferSpace(const DWORD bufSize, const DWORD bufCoun
 
 	return lBuffer;
 #else
-	totalBufferSize = bufSize;
-	char *lBuffer = (char*)malloc((size_t)bufSize);
+	totalBufferCount = bufCount;
+	totalBufferSize = bufSize * bufCount;
+	char *lBuffer = (char*)malloc((size_t)totalBufferSize);
 	return lBuffer;
 #endif
 }
@@ -801,25 +955,35 @@ if (USE_RIO)
 
 void GroovyMister::SendStream(uint8_t whichBuffer, uint32_t bytesToSend, uint32_t cSize)
 {
-	DWORD flags = RIO_MSG_DONT_NOTIFY | RIO_MSG_DEFER;
+	if (m_mtu == 0 || bytesToSend == 0 || bytesToSend > BUFFER_SIZE || (whichBuffer != 0 && whichBuffer != 1))
+	{
+		return;
+	}
+
 	uint32_t bytesSended = 0;
 #ifdef _WIN32
 if (USE_RIO)
 {				
+	DWORD flags = RIO_MSG_DONT_NOTIFY | RIO_MSG_DEFER;
 	int i=0;
 	while (bytesSended < bytesToSend)
 	{
+		if (i >= BUFFER_SLICES)
+		{
+			return;
+		}
+		uint32_t chunkSize = (bytesToSend - bytesSended >= m_mtu) ? m_mtu : bytesToSend - bytesSended;
 		if (whichBuffer == 0)
 		{			
-			m_pBufsBlit[i].Length = (bytesToSend - bytesSended >= m_mtu) ? m_mtu : bytesToSend - bytesSended;
+			m_pBufsBlit[i].Length = chunkSize;
 			m_rio.RIOSend(m_requestQueue, &m_pBufsBlit[i], 1, flags, &m_pBufsBlit[i]);
 		}	
 		else
 		{
-			m_pBufsAudio[i].Length = (bytesToSend - bytesSended >= m_mtu) ? m_mtu : bytesToSend - bytesSended;
+			m_pBufsAudio[i].Length = chunkSize;
 			m_rio.RIOSend(m_requestQueue, &m_pBufsAudio[i], 1, flags, &m_pBufsAudio[i]);
 		}
-		bytesSended += m_mtu;
+		bytesSended += chunkSize;
 		i++;
 	}
 	m_rio.RIOSend(m_requestQueue, NULL, 0, RIO_MSG_COMMIT_ONLY, NULL);
@@ -844,7 +1008,7 @@ if (USE_RIO)
 		{
 			Send(&pBufferAudio[bytesSended], chunkSize);
 		}
-		bytesSended += m_mtu;
+		bytesSended += chunkSize;
 	}
 }
 

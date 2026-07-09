@@ -8,16 +8,26 @@
  #include <ws2tcpip.h>
  #include <mswsock.h>
  #include "rio.h"
+#else
+ #include <cstring>
+ #include <cstdio>
+ #include <sys/socket.h>
+ #include <netinet/in.h>
+ #include <time.h>
 #endif
 
 #ifndef GROOVYMISTER_VERSION
 #define GROOVYMISTER_VERSION "1.0.0"
 #endif
 
-#define BUFFER_SIZE 1245312 // 720x576x3
-#define BUFFER_SLICES 846
+#define MAX_FRAME_WIDTH 720
+#define MAX_FRAME_HEIGHT 576
+#define MAX_PIXEL_BYTES 4
+#define BUFFER_SIZE (MAX_FRAME_WIDTH * MAX_FRAME_HEIGHT * MAX_PIXEL_BYTES)
 #define MTU_HEADER 28
-#define BUFFER_MTU 1500 - MTU_HEADER
+#define BUFFER_MTU (1500 - MTU_HEADER)
+#define BUFFER_SLICES ((BUFFER_SIZE + BUFFER_MTU - 1) / BUFFER_MTU)
+#define AUDIO_BUFFER_SIZE 32768
 
 //joystick map
 #define GM_JOY_RIGHT (1 << 0)
@@ -97,7 +107,7 @@ class GroovyMister
 	// Close connection
 	void CmdClose(void);
 	// Init streaming with ip, port, (lz4frames = 0-raw, 1-lz4, 2-lz4hc, 3-lz4 adaptative), soundRate(1-22k, 2-44.1, 3-48 khz), soundChan(1 or 2), rgbMode(0-RGB888, 1-RGBA888, 2-RGB565), mtu source
-	uint8_t CmdInit(const char* misterHost, uint16_t misterPort, uint8_t lz4Frames, uint32_t soundRate, uint8_t soundChan, uint8_t rgbMode, uint16_t mtu);
+	int CmdInit(const char* misterHost, uint16_t misterPort, uint8_t lz4Frames, uint32_t soundRate, uint8_t soundChan, uint8_t rgbMode, uint16_t mtu);
 	// Change resolution (check https://github.com/antonioginer/switchres) with modeline
 	void CmdSwitchres(double pClock, uint16_t hActive, uint16_t hBegin, uint16_t hEnd, uint16_t hTotal, uint16_t vActive, uint16_t vBegin, uint16_t vEnd, uint16_t vTotal, uint8_t interlace);
 	// Stream frame, vCountSync = 0 for auto frame delay or number of vertical line to sync with, margin with nanoseconds for auto frame delay)
@@ -128,6 +138,7 @@ class GroovyMister
 	RIO_CQ m_receiveQueue;
 	RIO_RQ m_requestQueue;
 	HANDLE m_hIOCP;
+	OVERLAPPED m_overlapped;
 	RIO_BUFFERID m_sendRioBufferId;
 	RIO_BUF m_sendRioBuffer;
 	RIO_BUFFERID m_receiveRioBufferId;
@@ -139,6 +150,8 @@ class GroovyMister
 	RIO_BUF m_sendRioBufferAudio;
 	RIO_BUF *m_pBufsAudio;
 	SOCKET m_sockInputsFD;
+	bool m_winsockStarted;
+	bool m_useRio;
 
 	LARGE_INTEGER m_tickStart;
 	LARGE_INTEGER m_tickEnd;
@@ -170,6 +183,8 @@ class GroovyMister
 	uint32_t m_streamTime;
 	uint32_t m_emulationTime;
 	uint16_t m_mtu;
+	uint8_t m_isConnected;
+	uint8_t m_modeConfigured;
 
 	char *AllocateBufferSpace(const DWORD bufSize, const DWORD bufCount, DWORD& totalBufferSize, DWORD& totalBufferCount);
 	void Send(void *cmd, int cmdSize);

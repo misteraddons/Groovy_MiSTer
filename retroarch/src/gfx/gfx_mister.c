@@ -406,7 +406,13 @@ static void mister_init(const char* mister_host, uint8_t compression, uint32_t s
    mister_video.rgb_mode = (pix_fmt == RETRO_PIXEL_FORMAT_RGB565 || settings->bools.mister_force_rgb565) ? RGB565 : RGB888;
 
    RARCH_LOG("[MiSTer] Sending CMD_INIT... lz4 %d sound_rate %d sound_chan %d rgb_mode %d mtu %d\n", compression, sound_rate, sound_channels, mister_video.rgb_mode, settings->uints.mister_mtu);
-   gmw_init(mister_host, compression, sound_rate, sound_channels, mister_video.rgb_mode, settings->uints.mister_mtu);
+   if (gmw_init(mister_host, compression, sound_rate, sound_channels, mister_video.rgb_mode, settings->uints.mister_mtu) != 0)
+   {
+      RARCH_ERR("[MiSTer] Connection failed.\n");
+      gmw_close();
+      mister_video.is_connected = false;
+      return;
+   }
 
    mister_video.is_connected = true;
 
@@ -428,6 +434,9 @@ static void mister_init(const char* mister_host, uint8_t compression, uint32_t s
 void mister_audio(void)
 {
    audio_driver_state_t *audio_st  = audio_state_get_ptr();
+
+   if (!mister_video.is_connected || !audio_buffer)
+      return;
 
    uint16_t audio_bytes = audio_st->output_mister_samples * 2;
    memcpy(audio_buffer, audio_st->output_mister_samples_conv_buf, audio_bytes);
