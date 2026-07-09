@@ -1,7 +1,8 @@
 param(
     [string]$DistDir = "dist",
     [switch]$AllowMissing,
-    [switch]$SkipManifest
+    [switch]$SkipManifest,
+    [switch]$NoClean
 )
 
 Set-StrictMode -Version Latest
@@ -9,6 +10,15 @@ $ErrorActionPreference = "Stop"
 
 $repoRoot = Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\..")
 $distPath = [System.IO.Path]::GetFullPath((Join-Path $repoRoot.Path $DistDir))
+$repoPrefix = $repoRoot.Path.TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
+
+if ($distPath -eq $repoRoot.Path -or -not $distPath.StartsWith($repoPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "DistDir must resolve to a dedicated directory inside the repository: $distPath"
+}
+
+if (-not $NoClean -and (Test-Path -LiteralPath $distPath)) {
+    Remove-Item -LiteralPath $distPath -Recurse -Force
+}
 
 New-Item -ItemType Directory -Force -Path $distPath | Out-Null
 
@@ -25,6 +35,7 @@ $artifacts = @(
         Name = "MiSTer_groovy"
         OutputName = "MiSTer_groovy"
         Candidates = @(
+            "build/hps-artifacts/MiSTer_groovy",
             "build/hps-src/bin/MiSTer_groovy",
             "build/hps-src/MiSTer_groovy",
             "hps_linux/src/MiSTer_groovy",
@@ -35,6 +46,7 @@ $artifacts = @(
         Name = "MiSTer_groovy_XDP"
         OutputName = "MiSTer_groovy_XDP"
         Candidates = @(
+            "build/hps-artifacts/MiSTer_groovy_XDP",
             "build/hps-src/bin/MiSTer_groovy_XDP",
             "build/hps-src/MiSTer_groovy_XDP",
             "hps_linux/src/MiSTer_groovy_XDP",
