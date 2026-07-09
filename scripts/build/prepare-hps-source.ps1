@@ -175,6 +175,12 @@ else
 PRJ = MiSTer_groovy
 endif
 '@
+    $null = Replace-TextRequired -Text $makefileRef -Description "Makefile production source filter" -AlreadyPresentText 'CPP_SRC := $(filter-out %_unittest.cpp,$(CPP_SRC))' `
+        -OldText "          `$`(wildcard ./support/*/*.cpp)`n`nIMG =" `
+        -NewText "          `$`(wildcard ./support/*/*.cpp)`n`nCPP_SRC := `$`(filter-out %_unittest.cpp,`$`(CPP_SRC))`n`nIMG ="
+    $null = Replace-TextRequired -Text $makefileRef -Description "Makefile GCC 10 C++ compatibility" -AlreadyPresentText "-Wno-class-memaccess -Wno-narrowing" `
+        -OldText "-std=gnu++14 -Wno-class-memaccess" `
+        -NewText "-std=gnu++14 -Wno-class-memaccess -Wno-narrowing"
     $null = Replace-TextRequired -Text $makefileRef -Description "Makefile AF_XDP libraries" -AlreadyPresentText "AFXDP_LIB = -Llib/libelf -lelf lib/libxdp/libxdp.a lib/libbpf/libbpf.a" `
         -OldText "IMLIB2_LIB  = -Llib/imlib2 -lfreetype -lbz2 -lpng16 -lz -lImlib2`n" `
         -NewText @'

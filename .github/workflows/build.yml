@@ -5,10 +5,38 @@ on:
   pull_request:
 
 jobs:
-  artifact-policy:
+  validation:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Enforce repository policy
         shell: pwsh
         run: ./scripts/release/check-repo-policy.ps1
+      - name: Check protocol safety invariants
+        shell: pwsh
+        run: |
+          ./tools/dev/test-audio-init.ps1
+          ./tools/dev/test-protocol-safety.ps1
+      - name: Compile maintained client APIs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/ci
+          g++ -std=c++17 -Wall -Wextra -Werror -Iapi -Iapi/lz4 -c api/groovymister.cpp -o build/ci/groovymister.o
+          g++ -std=c++17 -Wall -Wextra -Werror -Iapi -c api/groovymister_wrapper.cpp -o build/ci/groovymister_wrapper.o
+          g++ -std=c++17 -Wall -Wextra -Werror -Iretroarch/src/deps/mister -Iretroarch/src/deps -c retroarch/src/deps/mister/groovymister.cpp -o build/ci/retroarch_groovymister.o
+          g++ -std=c++17 -Wall -Wextra -Werror -Iretroarch/src/deps/mister -c retroarch/src/deps/mister/groovymister_wrapper.cpp -o build/ci/retroarch_groovymister_wrapper.o
+      - name: Build HPS server from upstream Main
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
+          git clone --depth 1 https://github.com/MiSTer-devel/Main_MiSTer.git Main_MiSTer
+          pwsh ./scripts/build/prepare-hps-source.ps1
+          make -C build/hps-src BASE=arm-linux-gnueabihf _AF_XDP=0
+          make -C build/hps-src BASE=arm-linux-gnueabihf _AF_XDP=0 clean
+          make -C build/hps-src BASE=arm-linux-gnueabihf _AF_XDP=1
+      - name: Check patch whitespace
+        shell: bash
+        run: git show --check --format= HEAD

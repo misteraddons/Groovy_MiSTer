@@ -113,13 +113,20 @@ try {
 
     $workflow = Read-Text ".github/workflows/build.yml"
     Assert-True ($workflow -match "check-repo-policy\.ps1") "CI must run the repository policy check"
+    Assert-True ($workflow -match "test-protocol-safety\.ps1") "CI must run protocol safety checks"
+    Assert-True ($workflow -match "test-audio-init\.ps1") "CI must run audio initialization regression checks"
+    Assert-True ($workflow -match "api/groovymister\.cpp") "CI must compile the canonical client API"
+    Assert-True ($workflow -match "retroarch/src/deps/mister/groovymister\.cpp") "CI must compile the active RetroArch client API"
+    Assert-True ($workflow -match "BASE=arm-linux-gnueabihf") "CI must cross-compile the HPS server"
 
     Assert-True (Test-Path -LiteralPath "scripts/release/stage-release.ps1") "Missing release staging script"
     $stageRelease = Read-Text "scripts/release/stage-release.ps1"
     foreach ($artifact in @("Groovy.rbf", "MiSTer_groovy", "MiSTer_groovy_XDP", "groovy_xdp_kern.o", "libelf.so.1")) {
         Assert-True ($stageRelease -match [regex]::Escape($artifact)) "Release staging script does not mention $artifact"
     }
+    Assert-True ($stageRelease -match [regex]::Escape("build/hps-artifacts/MiSTer_groovy")) "Release staging script must preserve both HPS build variants"
     Assert-True ($stageRelease -match [regex]::Escape("build/hps-src/bin/MiSTer_groovy")) "Release staging script must read prepared HPS build outputs"
+    Assert-True ($stageRelease -match [regex]::Escape('Remove-Item -LiteralPath $distPath -Recurse -Force')) "Release staging must clear stale distribution contents by default"
 
     Write-Host "Repository policy checks passed."
 }

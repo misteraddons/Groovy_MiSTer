@@ -5,7 +5,7 @@ $repoRoot = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $sourcePath = Join-Path $repoRoot "hps_linux\src\support\groovy\groovy.cpp"
 $source = Get-Content -LiteralPath $sourcePath -Raw
 
-$setInitMatch = [regex]::Match($source, "static void setInit\([\s\S]*?\n\}")
+$setInitMatch = [regex]::Match($source, "static (?:void|bool) setInit\([\s\S]*?\n\}\r?\n\r?\nstatic (?:void|bool) setBlit\(")
 if (-not $setInitMatch.Success) {
     throw "setInit not found"
 }
@@ -40,7 +40,7 @@ if ($cachedAudioIndex -lt $audioStatusIndex -or $cachedAudioIndex -gt $fpgaInitI
     throw "cached fpga_audio must be updated after AUDIO_OPT and before groovy_FPGA_init"
 }
 
-$setCloseMatch = [regex]::Match($source, "static void setClose\([\s\S]*?\n\}")
+$setCloseMatch = [regex]::Match($source, "static void setClose\([\s\S]*?\n\}\r?\n\r?\n#ifdef _AF_XDP")
 if (-not $setCloseMatch.Success) {
     throw "setClose not found"
 }
