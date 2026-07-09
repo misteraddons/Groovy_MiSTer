@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <cstring>
+#include <cmath>
 
 /* UDP server */
 #include <sys/socket.h>
@@ -82,9 +83,12 @@ static constexpr auto SERVER_TYPE_OPT = "[59]";
 #define HEADER_LEN 0xff
 #define CHUNK 7
 #define HEADER_OFFSET HEADER_LEN - CHUNK
-#define FRAMEBUFFER_SIZE  (720 * 576 * 4 * 2) // RGBA 720x576 with 2 fields
+#define MAX_FRAME_WIDTH 720
+#define MAX_FRAME_HEIGHT 576
+#define FRAME_REGION_SIZE (MAX_FRAME_WIDTH * MAX_FRAME_HEIGHT * 4)
+#define FRAMEBUFFER_SIZE  (FRAME_REGION_SIZE * 2) // RGBA 720x576 with 2 fields
 #define AUDIO_SIZE (8192 * 2 * 2)             // 8192 samples with 2 16bit-channels
-#define LZ4_SIZE (720 * 576 * 4)              // Estimated LZ4 MAX
+#define LZ4_SIZE FRAME_REGION_SIZE
 #define FIELD_OFFSET 0x195000                 // 0x12fcff position for fpga (after first field)
 #define AUDIO_OFFSET 0x32a000                 // 0x25f8ff position for fpga (after framebuffer)
 #define LZ4_OFFSET_A 0x332000                 // 0x2678ff position for fpga (after audio)
@@ -268,6 +272,8 @@ struct xsk_socket_info {
 
 static struct xsk_umem_info *umem;
 static struct xsk_socket_info *xsk_socket;
+static struct bpf_object *xdp_bpf_object;
+static bool xdp_attached;
 static int xsk_map_fd;
 static int packet_buffer_size;
 static void *packet_buffer;
@@ -277,19 +283,19 @@ static void *packet_buffer;
 /* General Server variables */
 static int groovyServer = 0;
 static const char network_interface[] = "eth0";
-static int sockfd;
+static int sockfd = -1;
 static struct sockaddr_in servaddr;
 static struct sockaddr_in clientaddr;
 static socklen_t clilen = sizeof(struct sockaddr);
 static char recvbuf[65536] = { 0 };
 static char sendbuf[55] = { 0 };
 
-static int sockfdInputs;
+static int sockfdInputs = -1;
 static struct sockaddr_in servaddrInputs;
 static struct sockaddr_in clientaddrInputs;
 static char sendbufInputs[83] = { 0 };
 
-static int sockfdGMC;
+static int sockfdGMC = -1;
 static struct sockaddr_in servaddrGMC;
 static struct sockaddr_in clientaddrGMC;
 static char sendbufGMC[65536] = { 0 };
@@ -322,6 +328,7 @@ static unsigned long logoTime = 0;
 static PoC_type *poc;
 static uint8_t *map = 0;
 static uint8_t* buffer;
+static uint32_t map_size;
 
 static int blitCompression = 0;
 static uint8_t audioRate = 0;
@@ -363,6 +370,77 @@ static unsigned long long stat_input_keepalives = 0;
 static unsigned long long stat_input_neutralizes = 0;
 
 static void groovy_neutralize_inputs(const char *reason);
+
+static inline uint16_t groovy_read_u16_le(const char *data)
+{
+	const uint8_t *bytes = (const uint8_t *)data;
+	return (uint16_t)bytes[0] | ((uint16_t)bytes[1] << 8);
+}
+
+static inline uint32_t groovy_read_u32_le(const char *data)
+{
+	const uint8_t *bytes = (const uint8_t *)data;
+	return (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) |
+		((uint32_t)bytes[2] << 16) | ((uint32_t)bytes[3] << 24);
+}
+
+static uint32_t groovy_payload_length()
+{
+	if (!poc)
+	{
+		return 0;
+	}
+
+	if (isBlitting == 2)
+	{
+		return poc->PoC_bytes_audio_len;
+	}
+
+	return blitCompression ? poc->PoC_bytes_lz4_len : poc->PoC_bytes_len;
+}
+
+static uint32_t groovy_payload_capacity()
+{
+	if (isBlitting == 2)
+	{
+		return AUDIO_SIZE;
+	}
+
+	return blitCompression ? LZ4_SIZE : FRAME_REGION_SIZE;
+}
+
+static bool groovy_payload_bounds_valid(uint32_t packet_len)
+{
+	if (!buffer || !poc || !isBlitting || packet_len == 0)
+	{
+		return false;
+	}
+
+	const uint32_t expected = groovy_payload_length();
+	const uint32_t capacity = groovy_payload_capacity();
+	const uint64_t region_end = (uint64_t)HEADER_OFFSET + poc->PoC_buffer_offset + capacity;
+	const uint64_t write_end = (uint64_t)poc->PoC_bytes_recv + packet_len;
+
+	return expected > 0 && expected <= capacity && poc->PoC_bytes_recv <= expected &&
+		write_end <= expected && region_end <= BUFFERSIZE;
+}
+
+static bool groovy_copy_payload(const char *packet, uint32_t packet_len)
+{
+	if (!groovy_payload_bounds_valid(packet_len))
+	{
+		stat_invalid_packets++;
+		LOG(0, "[PACKET_DROP][payload_bounds state=%d recv=%u len=%u expected=%u capacity=%u offset=%u]\n",
+			isBlitting, poc ? poc->PoC_bytes_recv : 0, packet_len,
+			groovy_payload_length(), groovy_payload_capacity(), poc ? poc->PoC_buffer_offset : 0);
+		isBlitting = 0;
+		isCorePriority = 0;
+		return false;
+	}
+
+	memcpy(buffer + HEADER_OFFSET + poc->PoC_buffer_offset + poc->PoC_bytes_recv, packet, packet_len);
+	return true;
+}
 
 static bool groovy_command_length_valid(uint8_t command, int len)
 {
@@ -584,6 +662,11 @@ static void groovy_FPGA_hps()
 
 static void groovy_FPGA_status(uint8_t isACK)
 {
+	if (!poc)
+	{
+		return;
+	}
+
     uint16_t req = 0;
     EnableIO();
     do
@@ -869,7 +952,7 @@ static void groovy_FPGA_blit_lz4(uint32_t bytes, uint16_t numBlit)
 
 }
 
-static void setSwitchres(char *recvbuf)
+static bool setSwitchres(char *recvbuf)
 {
     //modeline
     uint64_t udp_pclock_bits;
@@ -896,6 +979,33 @@ static void setSwitchres(char *recvbuf)
 
     u.i = udp_pclock_bits;
     double udp_pclock = u.d;
+
+	const bool horizontal_valid = udp_hactive > 0 && udp_hactive <= MAX_FRAME_WIDTH &&
+		udp_hactive <= udp_hbegin && udp_hbegin <= udp_hend && udp_hend <= udp_htotal &&
+		udp_htotal > udp_hactive && udp_hbegin - udp_hactive <= UINT8_MAX &&
+		udp_hend - udp_hbegin <= UINT8_MAX && udp_htotal - udp_hend <= UINT8_MAX;
+	const bool vertical_valid = udp_vactive > 0 && udp_vactive <= MAX_FRAME_HEIGHT &&
+		udp_vactive <= udp_vbegin && udp_vbegin <= udp_vend && udp_vend <= udp_vtotal &&
+		udp_vtotal > udp_vactive && udp_vbegin - udp_vactive <= UINT8_MAX &&
+		udp_vend - udp_vbegin <= UINT8_MAX && udp_vtotal - udp_vend <= UINT8_MAX;
+	uint64_t payload_bytes = (uint64_t)udp_hactive * udp_vactive *
+		((rgbMode == 1) ? 4 : (rgbMode == 2) ? 2 : 3);
+	if (udp_interlace == 1)
+	{
+		payload_bytes >>= 1;
+	}
+
+	if (!poc || !std::isfinite(udp_pclock) || udp_pclock <= 0.0 ||
+		!horizontal_valid || !vertical_valid || udp_interlace > 2 ||
+		payload_bytes == 0 || payload_bytes > FRAME_REGION_SIZE)
+	{
+		groovy_note_invalid_packet("modeline_values", CMD_SWITCHRES, 26);
+		LOG(0, "[MODELINE_REJECT][pclock=%f h=%d/%d/%d/%d v=%d/%d/%d/%d interlace=%d bytes=%llu]\n",
+			udp_pclock, udp_hactive, udp_hbegin, udp_hend, udp_htotal,
+			udp_vactive, udp_vbegin, udp_vend, udp_vtotal, udp_interlace,
+			(unsigned long long)payload_bytes);
+		return false;
+	}
 
     poc->PoC_width_time = (double) udp_htotal * (1 / (udp_pclock * 1000)); //in ms, time to raster 1 line
     poc->PoC_V_Total = udp_vtotal;    
@@ -982,6 +1092,7 @@ static void setSwitchres(char *recvbuf)
     buffer[27] =  udp_interlace;
 
     groovy_FPGA_switchres();
+	return true;
 }
 
 
@@ -994,18 +1105,31 @@ static void setClose()
 	numBlit = 0;
 	blitCompression = 0;
 	free(poc);
-	initDDR();
+	poc = nullptr;
+	if (buffer)
+	{
+		initDDR();
+	}
 	isConnected = 0;
 	isConnectedInputs = 0;
 
 	// load LOGO
 	if (doScreensaver)
 	{
-		loadLogo(1);
-		groovy_FPGA_init(1, 0, 0, 0);
-		groovy_FPGA_blit();
-		groovy_FPGA_logo(1);
-		groovyLogo = 1;
+		poc = (PoC_type *)calloc(1, sizeof(PoC_type));
+		if (poc)
+		{
+			loadLogo(1);
+			groovy_FPGA_init(1, 0, 0, 0);
+			groovy_FPGA_blit();
+			groovy_FPGA_logo(1);
+			groovyLogo = 1;
+		}
+		else
+		{
+			LOG(0, "[SCREENSAVER][state allocation failed]%s\n", "");
+			groovyLogo = 0;
+		}
 	}
 	
 	user_io_status_set(AUDIO_RATE_OPT, (uint32_t)0);
@@ -1360,14 +1484,14 @@ static void sendACK(uint32_t udp_frame, uint16_t udp_vsync)
 		complete_tx(xsk_socket);
 	}
 #endif
-	if (poc->PoC_joystick_keep_alive >= KEEP_ALIVE_FRAMES)
+	if (poc && poc->PoC_joystick_keep_alive >= KEEP_ALIVE_FRAMES)
 	{
 		stat_input_keepalives++;
 		LOG(2, "[JOY_ACK][%s]\n", "KEEP_ALIVE");
 		groovy_send_joysticks();
 	}
 
-	if (poc->PoC_ps2_keep_alive >= KEEP_ALIVE_FRAMES)
+	if (poc && poc->PoC_ps2_keep_alive >= KEEP_ALIVE_FRAMES)
 	{
 		stat_input_keepalives++;
 		LOG(2, "[KBD_ACK][%s]\n", "KEEP_ALIVE");
@@ -1375,15 +1499,30 @@ static void sendACK(uint32_t udp_frame, uint16_t udp_vsync)
 	}
 }
 
-static void setInit(uint8_t compression, uint8_t audio_rate, uint8_t audio_chan, uint8_t rgb_mode)
+static bool setInit(uint8_t compression, uint8_t audio_rate, uint8_t audio_chan, uint8_t rgb_mode)
 {
+	groovy_neutralize_inputs("reinit");
+	if (!poc)
+	{
+		poc = (PoC_type *)calloc(1, sizeof(PoC_type));
+	}
+	else
+	{
+		memset(poc, 0, sizeof(PoC_type));
+	}
+	if (!poc)
+	{
+		LOG(0, "[CMD_INIT][calloc failed]%s\n", "");
+		isConnected = 0;
+		return false;
+	}
+
 	difMs = 0;
 	fpga_lz4_uncompressed = 0;
 	blitCompression = (compression <= 1) ? compression : 0;
 	audioRate = (audio_rate <= 3) ? audio_rate : 0;
 	audioChannels = (audio_chan <= 2) ? audio_chan : 0;
 	rgbMode = (rgb_mode <= 2) ? rgb_mode : 0;
-	poc = (PoC_type *) calloc(1, sizeof(PoC_type));
 	initDDR();
 	isBlitting = 0;
 	usingOldBlit = 0;
@@ -1436,10 +1575,20 @@ static void setInit(uint8_t compression, uint8_t audio_rate, uint8_t audio_chan,
  	user_io_status_set(LZ4_OPT, (uint32_t)blitCompression);
  	
 	groovy_FPGA_init(1, audioRate, audioChannels, rgbMode);
+	return true;
 }
 
-static void setBlit(uint32_t udp_frame, uint8_t udp_field, uint32_t udp_lz4_size, uint8_t udp_frame_delta)
+static bool setBlit(uint32_t udp_frame, uint8_t udp_field, uint32_t udp_lz4_size, uint8_t udp_frame_delta)
 {
+	if (!poc || poc->PoC_bytes_len == 0 || poc->PoC_bytes_len > FRAME_REGION_SIZE ||
+		udp_field > 2 || (blitCompression && (udp_lz4_size == 0 || udp_lz4_size > LZ4_SIZE)))
+	{
+		groovy_note_invalid_packet("blit_values", CMD_BLIT_FIELD_VSYNC, 0);
+		LOG(0, "[BLIT_REJECT][frame=%u field=%u raw=%u compressed=%u]\n",
+			udp_frame, (unsigned)udp_field, poc ? poc->PoC_bytes_len : 0, udp_lz4_size);
+		return false;
+	}
+
 	poc->PoC_frame_recv = udp_frame;
 	poc->PoC_bytes_recv = (!blitCompression && udp_frame_delta) ? poc->PoC_bytes_len : 0; //on raw, only duplicated frame supported
 	poc->PoC_bytes_lz4_ddr = 0;
@@ -1513,20 +1662,30 @@ static void setBlit(uint32_t udp_frame, uint8_t udp_field, uint32_t udp_lz4_size
  		LOG(0, "[GET_STATUS][DDR fr=%d bl=%d][GPU fr=%d vc=%d fskip=%d vb=%d fd=%d][VRAM px=%d queue=%d sync=%d free=%d eof=%d][AUDIO=%d][LZ4 inf=%d]\n", poc->PoC_frame_ddr, numBlit, fpga_vga_frame, fpga_vga_vcount, fpga_vga_frameskip, fpga_vga_vblank, fpga_vga_f1, fpga_vram_pixels, fpga_vram_queue, fpga_vram_synced, fpga_vram_ready, fpga_vram_end_frame, fpga_audio, fpga_lz4_uncompressed);
  	}	
  	
- 	if (!poc->PoC_bytes_recv)
+	if (!poc->PoC_bytes_recv)
  	{
- 		clock_gettime(CLOCK_MONOTONIC, &blitStart);
- 	}		
+		clock_gettime(CLOCK_MONOTONIC, &blitStart);
+	}
+	return true;
 }
 
-static void setBlitAudio(uint16_t udp_bytes_samples)
+static bool setBlitAudio(uint16_t udp_bytes_samples)
 {
+	if (!poc || audioChannels == 0 || udp_bytes_samples == 0 || udp_bytes_samples > AUDIO_SIZE)
+	{
+		groovy_note_invalid_packet("audio_values", CMD_AUDIO, 3);
+		LOG(0, "[AUDIO_REJECT][bytes=%u channels=%u]\n",
+			(unsigned)udp_bytes_samples, (unsigned)audioChannels);
+		return false;
+	}
+
 	poc->PoC_bytes_audio_len = udp_bytes_samples;
 	poc->PoC_buffer_offset = AUDIO_OFFSET;
 	poc->PoC_bytes_recv = 0;
 
 	isBlitting = 2;
 	isCorePriority = 1;
+	return true;
 }
 
 static void setBlitRawAudio(uint16_t len)
@@ -1611,7 +1770,7 @@ static void setBlitLZ4(uint16_t len)
         }
 }
 
-static void groovy_map_ddr()
+static bool groovy_map_ddr()
 {
     	int pagesize = sysconf(_SC_PAGE_SIZE);
     	if (pagesize==0) pagesize=4096;
@@ -1620,14 +1779,32 @@ static void groovy_map_ddr()
     	int map_off = offset - map_start;
     	int num_bytes=BUFFERSIZE;
 
-    	map = (uint8_t*)shmem_map(map_start, num_bytes+map_off);
-    	buffer = map + map_off;
+	map_size = num_bytes + map_off;
+	map = (uint8_t*)shmem_map(map_start, map_size);
+	if (!map)
+	{
+		buffer = nullptr;
+		map_size = 0;
+		LOG(0, "[DDR][map failed addr=0x%x bytes=%d]\n", map_start, num_bytes + map_off);
+		return false;
+	}
+	buffer = map + map_off;
 
-    	initDDR();
-    	poc = (PoC_type *) calloc(1, sizeof(PoC_type));
+	initDDR();
+	poc = (PoC_type *) calloc(1, sizeof(PoC_type));
+	if (!poc)
+	{
+		LOG(0, "[DDR][state allocation failed]%s\n", "");
+		shmem_unmap(map, map_size);
+		map = nullptr;
+		buffer = nullptr;
+		map_size = 0;
+		return false;
+	}
 
-    	isCorePriority = 0;
-    	isBlitting = 0;
+	isCorePriority = 0;
+	isBlitting = 0;
+	return true;
 }
 
 #ifdef _AF_XDP
@@ -1647,6 +1824,7 @@ static struct xsk_umem_info *configure_xsk_umem(void *buffer, uint64_t size)
 	if (ret)
 	{
 		LOG(0, "[XDP][configure_xsk_umem:xsk_umem__create][%s]\n", "error");
+		free(umem);
 		return NULL;
 	}
 	umem->buffer = buffer;
@@ -1770,7 +1948,54 @@ static struct xsk_socket_info *xsk_configure_socket(struct xsk_umem_info *umem)
 	return xsk_info;
 
 xsk_socket_error:
+	if (xsk_info)
+	{
+		if (xsk_info->xsk)
+		{
+			xsk_socket__delete(xsk_info->xsk);
+		}
+		free(xsk_info);
+	}
 	return NULL;
+}
+
+static void groovy_xdp_cleanup()
+{
+	if (xsk_socket)
+	{
+		if (xsk_socket->xsk)
+		{
+			xsk_socket__delete(xsk_socket->xsk);
+		}
+		free(xsk_socket);
+		xsk_socket = nullptr;
+	}
+	if (umem)
+	{
+		if (umem->umem)
+		{
+			xsk_umem__delete(umem->umem);
+		}
+		free(umem);
+		umem = nullptr;
+	}
+	if (packet_buffer)
+	{
+		shmem_unmap(packet_buffer, packet_buffer_size);
+		packet_buffer = nullptr;
+		packet_buffer_size = 0;
+	}
+	if (xdp_attached)
+	{
+		bpf_set_link_xdp_fd(if_nametoindex(network_interface), -1, XDP_FLAGS_DRV_MODE);
+		xdp_attached = false;
+	}
+	if (xdp_bpf_object)
+	{
+		bpf_object__close(xdp_bpf_object);
+		xdp_bpf_object = nullptr;
+	}
+	sockfd = -1;
 }
 #endif
 
@@ -1860,7 +2085,6 @@ static void groovy_xdp_server_init()
 	int pagesize, map_start, map_off;
 	struct bpf_map *map;
 	struct rlimit rlim = {RLIM_INFINITY, RLIM_INFINITY};	
-	struct bpf_object *obj;
 	int prog_fd;
 	struct bpf_prog_load_attr prog_load_attr;
 	//struct xdp_multiprog *mp = NULL;	
@@ -1876,7 +2100,7 @@ static void groovy_xdp_server_init()
 	memset(&prog_load_attr, 0, sizeof(struct bpf_prog_load_attr));
 	prog_load_attr.prog_type = BPF_PROG_TYPE_XDP;
 	prog_load_attr.file = "/usr/lib/arm-linux-gnueabihf/bpf/groovy_xdp_kern.o";
-	if (bpf_prog_load_xattr(&prog_load_attr, &obj, &prog_fd))
+	if (bpf_prog_load_xattr(&prog_load_attr, &xdp_bpf_object, &prog_fd))
 	{
 		LOG(0, "[XDP][bpf_prog_load_xattr][%s]\n", "error");
 		goto init_error_xdp;
@@ -1893,7 +2117,13 @@ static void groovy_xdp_server_init()
 		LOG(0, "[XDP][bpf_set_link_xdp_fd][error %d]\n", err);
 		goto init_error_xdp;
 	}
-	map = bpf_object__find_map_by_name(obj, "xsks_map");
+	xdp_attached = true;
+	map = bpf_object__find_map_by_name(xdp_bpf_object, "xsks_map");
+	if (!map)
+	{
+		LOG(0, "[XDP][bpf_object__find_map_by_name][%s]\n", "error");
+		goto init_error_xdp;
+	}
 
 	// with dispatcher
 	/*
@@ -1941,7 +2171,7 @@ static void groovy_xdp_server_init()
     	map_off = XDP_BASEADDR - map_start;
     	packet_buffer_size = (XDP_NUM_FRAMES * XDP_FRAME_SIZE) + map_off;
     	packet_buffer = shmem_map_private(map_start, packet_buffer_size);
-    	if (packet_buffer == (void *)-1)
+	if (!packet_buffer)
     	{
     		LOG(0, "[XDP][mmap umem][%s]\n", "error");
     		goto init_error_xdp;
@@ -1967,6 +2197,7 @@ static void groovy_xdp_server_init()
 	return;
 
 init_error_xdp:
+	groovy_xdp_cleanup();
 	groovyServer = 1;
 }
 #endif
@@ -2059,6 +2290,11 @@ static void groovy_udp_server_init()
 	return;
 
 init_error_udp:
+	if (sockfd >= 0)
+	{
+		close(sockfd);
+		sockfd = -1;
+	}
 	groovyServer = 1;
 
 }
@@ -2114,7 +2350,14 @@ static void groovy_udp_server_init_inputs()
     		goto inputs_error;
     	}
 
+	return;
+
 inputs_error:
+	if (sockfdInputs >= 0)
+	{
+		close(sockfdInputs);
+		sockfdInputs = -1;
+	}
     	isConnectedInputs = 0;
 }
 
@@ -2169,7 +2412,14 @@ static void groovy_udp_server_init_gmc()
     		goto gmc_error;
     	}
 		
+	return;
+
 gmc_error:
+	if (sockfdGMC >= 0)
+	{
+		close(sockfdGMC);
+		sockfdGMC = -1;
+	}
     	isConnectedGMC = 0;
 }
 
@@ -2269,8 +2519,10 @@ static inline void process_packet(char *recvbufPtr, int len)
 						uint8_t audio_channels = recvbufPtr[3];
 						uint8_t rgb_mode = (len == 5) ? recvbufPtr[4] : 0;
 						LOG(1, "[CMD_INIT][%d][LZ4=%d][Audio rate=%d chan=%d][%s][ver=%d]\n", recvbufPtr[0], compression, audio_rate, audio_channels, (rgb_mode == 1) ? "RGBA888" : (rgb_mode == 2) ? "RGB565" : "RGB888", GROOVY_VERSION);
-						setInit(compression, audio_rate, audio_channels, rgb_mode);
-						sendACK(0, 0);						
+						if (setInit(compression, audio_rate, audio_channels, rgb_mode))
+						{
+							sendACK(0, 0);
+						}
 					}
 				}; break;
 
@@ -2287,7 +2539,7 @@ static inline void process_packet(char *recvbufPtr, int len)
 				{
 					if (len == 3)
 					{
-						uint16_t udp_bytes_samples = ((uint16_t) recvbufPtr[2]  << 8) | recvbufPtr[1];
+						uint16_t udp_bytes_samples = groovy_read_u16_le(&recvbufPtr[1]);
 						LOG(1, "[CMD_AUDIO][%d][Bytes=%d]\n", recvbufPtr[0], udp_bytes_samples);
 						setBlitAudio(udp_bytes_samples);						
 					}
@@ -2309,21 +2561,29 @@ static inline void process_packet(char *recvbufPtr, int len)
 				{
 					if (len == 7 || len == 11)
 					{
-						uint32_t udp_lz4_size = 0;																							
-						uint32_t udp_frame = ((uint32_t) recvbufPtr[4]  << 24) | ((uint32_t)recvbufPtr[3]  << 16) | ((uint32_t)recvbufPtr[2]  << 8) | recvbufPtr[1];								
+						if (!poc)
+						{
+							groovy_note_invalid_packet("blit_without_state", CMD_BLIT_VSYNC, len);
+							break;
+						}
+						uint32_t udp_lz4_size = 0;
+						uint32_t udp_frame = groovy_read_u32_le(&recvbufPtr[1]);
 						uint8_t udp_field = (poc->PoC_FB_progressive) ? 0 : 2;	
-						uint16_t udp_vsync = ((uint16_t) recvbufPtr[6]  << 8) | recvbufPtr[5];						
+						uint16_t udp_vsync = groovy_read_u16_le(&recvbufPtr[5]);
 						if (len == 11 && blitCompression)
 						{
-							udp_lz4_size = ((uint32_t) recvbufPtr[10]  << 24) | ((uint32_t)recvbufPtr[9]  << 16) | ((uint32_t)recvbufPtr[8]  << 8) | recvbufPtr[7];								
+							udp_lz4_size = groovy_read_u32_le(&recvbufPtr[7]);
 							LOG(1, "[CMD_BLIT][%d][Frame=%d][Vsync=%d][CSize=%d]\n", recvbufPtr[0], udp_frame, udp_vsync, udp_lz4_size);
 						}
 						else
 						{
 							LOG(1, "[CMD_BLIT][%d][Frame=%d][Vsync=%d]\n", recvbufPtr[0], udp_frame, udp_vsync);
 						}																	
-				       		setBlit(udp_frame, udp_field, udp_lz4_size, 0);
-				       		groovy_FPGA_status(1);
+						if (!setBlit(udp_frame, udp_field, udp_lz4_size, 0))
+						{
+							break;
+						}
+						groovy_FPGA_status(1);
 				       		//LOG(1, "[GET_STATUS][DDR fr=%d bl=%d][GPU vc=%d fr=%d fskip=%d vb=%d fd=%d][VRAM px=%d queue=%d sync=%d free=%d eof=%d][LZ4 state_1=%d inf=%d wr=%d, run=%d resume=%d t1=%d t2=%d cmd_fskip=%d stop=%d AB=%d com=%d grav=%d lleg=%d, sub=%d blit=%d]\n", poc->PoC_frame_ddr, numBlit, fpga_vga_vcount, fpga_vga_frame, fpga_vga_frameskip, fpga_vga_vblank, fpga_vga_f1, fpga_vram_pixels, fpga_vram_queue, fpga_vram_synced, fpga_vram_ready, fpga_vram_end_frame, fpga_lz4_state, fpga_lz4_uncompressed, fpga_lz4_writed, fpga_lz4_run, fpga_lz4_resume, fpga_lz4_test1, fpga_lz4_test2, fpga_lz4_cmd_fskip, fpga_lz4_stop, fpga_lz4_ABCD, fpga_lz4_compressed, fpga_lz4_gravats, fpga_lz4_llegits, fpga_lz4_subframe_bytes, fpga_lz4_subframe_blit);
 				       		sendACK(udp_frame, udp_vsync);	
 				       		usingOldBlit = 1;			       		
@@ -2334,11 +2594,16 @@ static inline void process_packet(char *recvbufPtr, int len)
 				{
 					if (len == 8 || len == 12 || len == 9 || len == 13)
 					{
+						if (!poc)
+						{
+							groovy_note_invalid_packet("blit_without_state", CMD_BLIT_FIELD_VSYNC, len);
+							break;
+						}
 						uint32_t udp_lz4_size = 0;
 						uint8_t udp_frame_delta = 0;
-						uint32_t udp_frame = ((uint32_t) recvbufPtr[4]  << 24) | ((uint32_t)recvbufPtr[3]  << 16) | ((uint32_t)recvbufPtr[2]  << 8) | recvbufPtr[1];
+						uint32_t udp_frame = groovy_read_u32_le(&recvbufPtr[1]);
 						uint8_t udp_field = (poc->PoC_FB_progressive) ? 0 : (uint8_t) recvbufPtr[5];
-						uint16_t udp_vsync = ((uint16_t) recvbufPtr[7]  << 8) | recvbufPtr[6];	
+						uint16_t udp_vsync = groovy_read_u16_le(&recvbufPtr[6]);
 						if (len == 9 && !blitCompression)
 						{
 							udp_frame_delta = recvbufPtr[8]; 
@@ -2349,15 +2614,18 @@ static inline void process_packet(char *recvbufPtr, int len)
 						}			
 						if ((len == 12 || len == 13) && blitCompression)
 						{
-							udp_lz4_size = ((uint32_t) recvbufPtr[11]  << 24) | ((uint32_t)recvbufPtr[10]  << 16) | ((uint32_t)recvbufPtr[9]  << 8) | recvbufPtr[8];								
+							udp_lz4_size = groovy_read_u32_le(&recvbufPtr[8]);
 							LOG(1, "[CMD_BLIT][%d][Frame=%d(%d)][Vsync=%d][CSize=%d][Delta=%d]\n", recvbufPtr[0], udp_frame, udp_field, udp_vsync, udp_lz4_size, udp_frame_delta);							
 						}
 						else							
 						{
 							LOG(1, "[CMD_BLIT][%d][Frame=%d(%d)][Vsync=%d][Dup=%d]\n", recvbufPtr[0], udp_frame, udp_field, udp_vsync, udp_frame_delta);
 						}				       																
-				       		setBlit(udp_frame, udp_field, udp_lz4_size, udp_frame_delta);
-				       		groovy_FPGA_status(1);
+						if (!setBlit(udp_frame, udp_field, udp_lz4_size, udp_frame_delta))
+						{
+							break;
+						}
+						groovy_FPGA_status(1);
 				       		//LOG(1, "[GET_STATUS][DDR fr=%d bl=%d][GPU vc=%d fr=%d fskip=%d vb=%d fd=%d][VRAM px=%d queue=%d sync=%d free=%d eof=%d][LZ4 state_1=%d inf=%d wr=%d, run=%d resume=%d t1=%d t2=%d cmd_fskip=%d stop=%d AB=%d com=%d grav=%d lleg=%d, sub=%d blit=%d]\n", poc->PoC_frame_ddr, numBlit, fpga_vga_vcount, fpga_vga_frame, fpga_vga_frameskip, fpga_vga_vblank, fpga_vga_f1, fpga_vram_pixels, fpga_vram_queue, fpga_vram_synced, fpga_vram_ready, fpga_vram_end_frame, fpga_lz4_state, fpga_lz4_uncompressed, fpga_lz4_writed, fpga_lz4_run, fpga_lz4_resume, fpga_lz4_test1, fpga_lz4_test2, fpga_lz4_cmd_fskip, fpga_lz4_stop, fpga_lz4_ABCD, fpga_lz4_compressed, fpga_lz4_gravats, fpga_lz4_llegits, fpga_lz4_subframe_bytes, fpga_lz4_subframe_blit);
 				       		sendACK(udp_frame, udp_vsync);				       		
 				       	}
@@ -2610,8 +2878,10 @@ static inline int process_packet_eth(struct xsk_socket_info *xsk, uint64_t addr,
 
 	if (isBlitting)
 	{
-		memcpy((char *) (buffer + HEADER_OFFSET + poc->PoC_buffer_offset + poc->PoC_bytes_recv), &data_pointer[42], udp_len);
-		process_packet(&data_pointer[42], udp_len);
+		if (groovy_copy_payload(&data_pointer[42], udp_len))
+		{
+			process_packet(&data_pointer[42], udp_len);
+		}
 	}
 	else
 	{
@@ -2699,7 +2969,10 @@ static void groovy_start()
     		groovy_FPGA_init(0, 0, 0, 0);
 
 		// map DDR
-		groovy_map_ddr();
+		if (!groovy_map_ddr())
+		{
+			goto start_error;
+		}
 
 		groovyServer = 1;
 	}
@@ -2751,48 +3024,53 @@ start_error:
 
 void groovy_stop()
 {
+	groovy_neutralize_inputs("stop");
+
 	if (doARMClock)
 	{
 		setARMClock(0);
 	}
 
-	if (groovyServer == 2)
+	if (!doXDPServer && sockfd >= 0)
 	{
-		if (!doXDPServer)
-		{
-			LOG(0, "[UDP][%s]\n", "Closing");
-			close(sockfd);
-		}
-#ifdef _AF_XDP
-		else
-		{
-		
-			LOG(0, "[XDP][%s]\n", "Closing");
-			if (xsk_socket->xsk != NULL)
-			{
-				xsk_socket__delete(xsk_socket->xsk);
-				LOG(0, "[XDP][%s]\n", "Closing socket");
-			}
-			if (umem->umem != NULL)
-			{
-				xsk_umem__delete(umem->umem);
-				shmem_unmap(packet_buffer, packet_buffer_size);
-				LOG(0, "[XDP][%s]\n", "Unmap umem");
-			}
-			bpf_set_link_xdp_fd(if_nametoindex(network_interface), -1, XDP_FLAGS_DRV_MODE);
-			LOG(0, "[XDP][Unloading xdp %s]\n", network_interface);
-			//bpf_set_link_xdp_fd(if_nametoindex(network_interface), -1, XDP_FLAGS_SKB_MODE);
-
-		}
-#endif		
-		if (sockfdInputs)
-		{
-			LOG(0, "[UDP][%s]\n", "Closing inputs");
-			close(sockfdInputs);
-		}
-		sockfd = 0;
-		sockfdInputs = 0;		
+		LOG(0, "[UDP][%s]\n", "Closing");
+		close(sockfd);
+		sockfd = -1;
 	}
+#ifdef _AF_XDP
+	if (doXDPServer)
+	{
+		if (xsk_socket || umem || packet_buffer || xdp_attached || xdp_bpf_object)
+		{
+			LOG(0, "[XDP][%s]\n", "Closing");
+		}
+		groovy_xdp_cleanup();
+	}
+#endif
+	if (sockfdInputs >= 0)
+	{
+		LOG(0, "[UDP][%s]\n", "Closing inputs");
+		close(sockfdInputs);
+		sockfdInputs = -1;
+	}
+	if (sockfdGMC >= 0)
+	{
+		LOG(0, "[UDP][%s]\n", "Closing GMC");
+		close(sockfdGMC);
+		sockfdGMC = -1;
+	}
+	free(poc);
+	poc = nullptr;
+	if (map)
+	{
+		shmem_unmap(map, map_size);
+		map = nullptr;
+		buffer = nullptr;
+		map_size = 0;
+	}
+	isConnected = 0;
+	isConnectedInputs = 0;
+	isConnectedGMC = 0;
 	printf("Groovy-Server %d stopped\n", GROOVY_VERSION);
 	groovyServer = 0;
 }
@@ -2807,7 +3085,7 @@ void groovy_poll()
 
 	do
 	{
-		if (doVerbose == 3 && isConnected && poc->PoC_bytes_len > 0)		
+		if (doVerbose == 3 && isConnected && poc && poc->PoC_bytes_len > 0)
 		{
 			groovy_FPGA_status(0);
 			//LOG(3, "[GET_STATUS][DDR fr=%d bl=%d][GPU vc=%d fr=%d fskip=%d vb=%d fd=%d][VRAM px=%d queue=%d sync=%d free=%d eof=%d][LZ4 state_1=%d inf=%d wr=%d, run=%d resume=%d t1=%d t2=%d cmd_fskip=%d stop=%d AB=%d com=%d grav=%d lleg=%d, sub=%d blit=%d]\n", poc->PoC_frame_ddr, numBlit, fpga_vga_vcount, fpga_vga_frame, fpga_vga_frameskip, fpga_vga_vblank, fpga_vga_f1, fpga_vram_pixels, fpga_vram_queue, fpga_vram_synced, fpga_vram_ready, fpga_vram_end_frame, fpga_lz4_state, fpga_lz4_uncompressed, fpga_lz4_writed, fpga_lz4_run, fpga_lz4_resume, fpga_lz4_test1, fpga_lz4_test2, fpga_lz4_cmd_fskip, fpga_lz4_stop, fpga_lz4_ABCD, fpga_lz4_compressed, fpga_lz4_gravats, fpga_lz4_llegits, fpga_lz4_subframe_bytes, fpga_lz4_subframe_blit);
@@ -2817,9 +3095,18 @@ void groovy_poll()
 
 		if (!doXDPServer)
 		{
-			char* recvbufPtr = (isBlitting) ? (char *) (buffer + HEADER_OFFSET + poc->PoC_buffer_offset + poc->PoC_bytes_recv) : (char *) &recvbuf[0];
-			int len = recvfrom(sockfd, recvbufPtr, 65536, 0, (struct sockaddr *)&clientaddr, &clilen);
-			process_packet(recvbufPtr, len);
+			int len = recvfrom(sockfd, recvbuf, sizeof(recvbuf), 0, (struct sockaddr *)&clientaddr, &clilen);
+			if (len > 0 && isBlitting)
+			{
+				if (groovy_copy_payload(recvbuf, (uint32_t)len))
+				{
+					process_packet(recvbuf, len);
+				}
+			}
+			else
+			{
+				process_packet(recvbuf, len);
+			}
 		}
 #ifdef _AF_XDP
 		else
@@ -2844,6 +3131,11 @@ void groovy_poll()
 
 void groovy_send_joystick(unsigned char joystick, uint32_t map)
 {
+	if (!poc)
+	{
+		return;
+	}
+
 	poc->PoC_joystick_order++;
 	if (joystick == 0)
 	{
@@ -2867,6 +3159,11 @@ void groovy_send_joystick(unsigned char joystick, uint32_t map)
 
 void groovy_send_analog(unsigned char joystick, unsigned char analog, char valueX, char valueY)
 {
+	if (!poc)
+	{
+		return;
+	}
+
 	poc->PoC_joystick_order++;
 	if (joystick == 0)
 	{
@@ -2908,8 +3205,17 @@ void groovy_send_analog(unsigned char joystick, unsigned char analog, char value
 
 void groovy_send_keyboard(uint16_t key, int press)
 {
-	poc->PoC_ps2_order++;
+	if (!poc || (size_t)key >= sizeof(key2sdl) / sizeof(key2sdl[0]))
+	{
+		return;
+	}
+
 	int index = key2sdl[key];
+	if (index <= 0 || index >= (int)(sizeof(poc->PoC_ps2_keyboard_keys) * 8))
+	{
+		return;
+	}
+	poc->PoC_ps2_order++;
 	int bit = 1 & (poc->PoC_ps2_keyboard_keys[index / 8] >> (index % 8));
 	if (bit)
 	{
@@ -2939,6 +3245,11 @@ void groovy_send_keyboard(uint16_t key, int press)
 
 void groovy_send_mouse(unsigned char ps2, unsigned char x, unsigned char y, unsigned char z)
 {
+	if (!poc)
+	{
+		return;
+	}
+
 	bitByte bits;
 	bits.byte = ps2;
 	poc->PoC_ps2_order++;
@@ -2976,11 +3287,18 @@ void groovy_user_io_file_gmc(const char* name)
 	LOG(0,"[GMC][%s]\n", name); 
 	size_t fSize = 0;
 	char* sendbufPtr = (doXDPServer) ? (char*) &sendbufGMC[42] : (char*) &sendbufGMC[0];
-	fSize = FileLoad(name, sendbufPtr, 65536);	
+	size_t maxPayload = 65507;
+#ifdef _AF_XDP
+	if (doXDPServer)
+	{
+		maxPayload = XDP_FRAME_SIZE - 42;
+	}
+#endif
+	fSize = FileLoad(name, sendbufPtr, maxPayload);
 
     	if (isConnectedGMC)
     	{
-    		LOG(2, "[GMC][Send]%s\n", sendbufPtr);
+		LOG(2, "[GMC][Send]%.*s\n", (int)fSize, sendbufPtr);
     		if (!doXDPServer)
     		{
     			sendto(sockfdGMC, sendbufPtr, fSize, 0, (struct sockaddr *)&clientaddrGMC, clilen);
@@ -3020,7 +3338,7 @@ void groovy_user_io_file_gmc(const char* name)
     	}
     	else
     	{
-    		LOG(2, "[GMC][Read]%s\n", sendbufPtr);
+		LOG(2, "[GMC][Read]%.*s\n", (int)fSize, sendbufPtr);
     	}
     	
 }
