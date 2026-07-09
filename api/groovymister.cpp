@@ -112,6 +112,12 @@ GroovyMister::GroovyMister()
 	m_delta_enabled[0] = 0;
 	m_delta_enabled[1] = 0;
 	m_isConnected = 0;
+	m_modeConfigured = 0;
+	memset(&m_serverAddr, 0, sizeof(m_serverAddr));
+	memset(&m_serverAddrInputs, 0, sizeof(m_serverAddrInputs));
+	memset(m_bufferSend, 0, sizeof(m_bufferSend));
+	memset(m_bufferReceive, 0, sizeof(m_bufferReceive));
+	memset(m_bufferInputsReceive, 0, sizeof(m_bufferInputsReceive));
 
 	memset(&m_tickStart, 0, sizeof(m_tickStart));
 	memset(&m_tickEnd, 0, sizeof(m_tickEnd));
@@ -126,17 +132,22 @@ GroovyMister::GroovyMister()
 	m_receiveQueue = RIO_INVALID_CQ;
 	m_requestQueue = RIO_INVALID_RQ;
 	m_hIOCP = NULL;
+	ZeroMemory(&m_overlapped, sizeof(m_overlapped));
 	m_sendRioBufferId = RIO_INVALID_BUFFERID;
 	m_receiveRioBufferId = RIO_INVALID_BUFFERID;
 	m_sendRioBufferAudioId = RIO_INVALID_BUFFERID;
 	m_pBufsAudio = nullptr;
 	m_winsockStarted = false;
 	m_useRio = false;
+	QueryPerformanceFrequency(&m_tickFrequency);
 	for (int i = 0; i < 2; i++)
 	{
 		m_sendRioBufferBlitId[i] = RIO_INVALID_BUFFERID;
 		m_pBufsBlit[i] = nullptr;
 	}
+#else
+	m_sockFD = -1;
+	m_sockInputsFD = -1;
 #endif
 
 	DWORD totalBufferCount = 0;
@@ -153,6 +164,7 @@ GroovyMister::GroovyMister()
 
 GroovyMister::~GroovyMister()
 {
+	CmdClose();
 #ifdef _WIN32
 	VirtualFree(m_pBufferAudio, 0, MEM_RELEASE);
 	VirtualFree(m_pBufferBlitDelta, 0, MEM_RELEASE);
@@ -174,7 +186,7 @@ GroovyMister::~GroovyMister()
 
 char* GroovyMister::getPBufferBlit(uint8_t field)
 {
-	return m_pBufferBlit[field];
+	return (field < 2) ? m_pBufferBlit[field] : nullptr;
 }
 
 char* GroovyMister::getPBufferBlitDelta(void)
@@ -261,10 +273,19 @@ void GroovyMister::CmdClose(void)
 	}
 	m_useRio = false;
 #else
-	close(m_sockFD);
-	close(m_sockInputsFD);
+	if (m_sockFD >= 0)
+	{
+		close(m_sockFD);
+		m_sockFD = -1;
+	}
+	if (m_sockInputsFD >= 0)
+	{
+		close(m_sockInputsFD);
+		m_sockInputsFD = -1;
+	}
 #endif
 	m_isConnected = 0;
+	m_modeConfigured = 0;
 }
 
 void GroovyMister::setVerbose(uint8_t sev)
@@ -279,21 +300,38 @@ const char* GroovyMister::getVersion()
 
 int GroovyMister::CmdInit(const char* misterHost, uint16_t misterPort, int lz4Frames, uint32_t soundRate, uint8_t soundChan, uint8_t rgbMode, uint16_t mtu)
 {
+	if (!misterHost || !misterHost[0] || misterPort == 0 || lz4Frames < 0 || lz4Frames > 6 ||
+		(soundRate != 0 && soundRate != 22050 && soundRate != 44100 && soundRate != 48000) ||
+		soundChan > 2 || rgbMode > 2 || (mtu != 0 && mtu != 1500 && mtu != 3800) ||
+		!m_pBufferAudio || !m_pBufferBlitDelta || !m_pBufferBlit[0] || !m_pBufferBlit[1] ||
+		!m_pBufferLZ4[0] || !m_pBufferLZ4[1])
+	{
+		LOG(0, "[MiSTer] Invalid initialization parameters%s\n", "");
+		return -2;
+	}
+
+	CmdClose();
 	m_isConnected = 0;
+	m_modeConfigured = 0;
 	m_mtu = (!mtu) ? BUFFER_MTU : mtu - MTU_HEADER;
 
 	// Set server
 	m_serverAddr.sin_family = AF_INET;
 	m_serverAddr.sin_port = htons(misterPort);
 	m_serverAddr.sin_addr.s_addr = inet_addr(misterHost);
+	if (m_serverAddr.sin_addr.s_addr == INADDR_NONE)
+	{
+		LOG(0, "[MiSTer] Invalid IPv4 address: %s\n", misterHost);
+		return -2;
+	}
 
 	// Set socket
 #ifdef _WIN32
 	WSADATA wsd;
-	uint16_t rc;
+	int rc;
 	bool rioFallbackAvailable = (USE_RIO != 0);
 	bool usedRioFallback = false;
-	m_useRio = rioFallbackAvailable;
+	m_useRio = false;
 
 	auto fallbackToStandardUdp = [&](const char* reason) -> bool
 	{
@@ -318,6 +356,7 @@ retry_socket_init:
 		return -1;
 	}
 	m_winsockStarted = true;
+	m_useRio = rioFallbackAvailable;
 
 	m_sockFD = INVALID_SOCKET;
 
@@ -371,15 +410,14 @@ retry_socket_init:
 			return -1;
 		}
 
-		OVERLAPPED overlapped;
-			ZeroMemory(&overlapped, sizeof(overlapped));
+		ZeroMemory(&m_overlapped, sizeof(m_overlapped));
 
 		RIO_NOTIFICATION_COMPLETION completionType ;
 
 		completionType.Type = RIO_IOCP_COMPLETION;
 		completionType.Iocp.IocpHandle = m_hIOCP;
 		completionType.Iocp.CompletionKey = (void*)1;
-		completionType.Iocp.Overlapped = &overlapped;
+		completionType.Iocp.Overlapped = &m_overlapped;
 
 		LOG(0,"[MiSTer] Register Buffers %s...\n","");
 		m_sendRioBufferId = m_rio.RIORegisterBuffer(m_bufferSend, 26);
@@ -439,9 +477,10 @@ retry_socket_init:
 	
 				pBuffer->BufferId = m_sendRioBufferBlitId[field];
 				pBuffer->Offset = offset;
-				pBuffer->Length = m_mtu;
+				pBuffer->Length = (offset < BUFFER_SIZE) ?
+					((BUFFER_SIZE - offset < m_mtu) ? BUFFER_SIZE - offset : m_mtu) : 0;
 	
-				offset += m_mtu;
+				offset += pBuffer->Length;
 			}
 		}
 		m_sendRioBufferAudioId = m_rio.RIORegisterBuffer(m_pBufferAudio, BUFFER_SIZE);
@@ -462,9 +501,10 @@ retry_socket_init:
 
 			pBuffer->BufferId = m_sendRioBufferAudioId;
 			pBuffer->Offset = offset;
-			pBuffer->Length = m_mtu;
+			pBuffer->Length = (offset < BUFFER_SIZE) ?
+				((BUFFER_SIZE - offset < m_mtu) ? BUFFER_SIZE - offset : m_mtu) : 0;
 
-			offset += m_mtu;
+			offset += pBuffer->Length;
 		}
 
 		LOG(0,"[MiSTer] Create queues %s...\n","");
@@ -556,7 +596,7 @@ retry_socket_init:
 	LOG(0,"[MiSTer] Setting socket async %s...\n","");
 	// Non blocking socket
 	int flags;
-	flags = fcntl(m_sockFD, F_GETFD, 0);
+	flags = fcntl(m_sockFD, F_GETFL, 0);
 	if (flags < 0)
 	{
 		LOG(0,"[MiSTer] get falg error %d\n", flags);
@@ -649,15 +689,30 @@ void GroovyMister::CmdSwitchres(double pClock, uint16_t hActive, uint16_t hBegin
 {
 	if (!m_isConnected)
 	  return;
-	  
-	uint8_t interlace_modeline = (interlace != 2) ? interlace : 1;
 
-	m_RGBSize = (m_rgbMode == 1) ? (hActive * vActive) << 2 : (m_rgbMode == 2) ? (hActive * vActive) << 1 : hActive * vActive * 3;
-
+	m_modeConfigured = 0;
+	const bool horizontalValid = hActive > 0 && hActive <= MAX_FRAME_WIDTH && hActive <= hBegin &&
+		hBegin <= hEnd && hEnd <= hTotal && hTotal > hActive && hBegin - hActive <= UINT8_MAX &&
+		hEnd - hBegin <= UINT8_MAX && hTotal - hEnd <= UINT8_MAX;
+	const bool verticalValid = vActive > 0 && vActive <= MAX_FRAME_HEIGHT && vActive <= vBegin &&
+		vBegin <= vEnd && vEnd <= vTotal && vTotal > vActive && vBegin - vActive <= UINT8_MAX &&
+		vEnd - vBegin <= UINT8_MAX && vTotal - vEnd <= UINT8_MAX;
+	uint64_t rgbSize = (uint64_t)hActive * vActive * ((m_rgbMode == 1) ? 4 : (m_rgbMode == 2) ? 2 : 3);
 	if (interlace == 1)
 	{
-		m_RGBSize = m_RGBSize >> 1;
+		rgbSize >>= 1;
 	}
+	if (!isfinite(pClock) || pClock <= 0.0 || !horizontalValid || !verticalValid ||
+		interlace > 2 || rgbSize == 0 || rgbSize > BUFFER_SIZE)
+	{
+		LOG(0, "[MiSTer] Rejected invalid modeline %ux%u (%llu bytes)\n",
+			(unsigned)hActive, (unsigned)vActive, (unsigned long long)rgbSize);
+		return;
+	}
+
+	uint8_t interlace_modeline = (interlace != 2) ? interlace : 1;
+
+	m_RGBSize = (uint32_t)rgbSize;
 
 	m_widthTime = static_cast<uint32_t>(10 * round((double) hTotal * (1 / pClock))); //in nanosec, time to raster 1 line
 	m_frameTime = (m_widthTime * vTotal) >> interlace_modeline;
@@ -680,11 +735,13 @@ void GroovyMister::CmdSwitchres(double pClock, uint16_t hActive, uint16_t hBegin
 	memcpy(&m_bufferSend[25],&interlace,sizeof(interlace));
 
 	Send(&m_bufferSend[0], 26);
+	m_modeConfigured = 1;
 }
 
 void GroovyMister::CmdBlit(uint32_t frame, uint8_t field, uint16_t vCountSync, uint32_t margin, uint32_t matchDeltaBytes)
 {
-	if (!m_isConnected)
+	if (!m_isConnected || !m_modeConfigured || field > 1 || m_RGBSize == 0 ||
+		m_RGBSize > BUFFER_SIZE || matchDeltaBytes > m_RGBSize || m_frameTime == 0)
 	  return;
 	  
 	m_frame = frame;
@@ -698,7 +755,9 @@ void GroovyMister::CmdBlit(uint32_t frame, uint8_t field, uint16_t vCountSync, u
 		}
 		else
 		{
-			uint32_t timeCalc = (m_network_ping + margin + m_emulationTime >= m_frameTime) ? 0 : m_network_ping + margin + m_emulationTime - m_streamTime;
+			uint64_t targetTime = (uint64_t)m_network_ping + margin + m_emulationTime;
+			uint32_t timeCalc = (targetTime >= m_frameTime || targetTime <= m_streamTime) ? 0 :
+				(uint32_t)(targetTime - m_streamTime);
 			uint32_t vSyncCalc = (timeCalc == 0) ? 1 : m_vTotal - static_cast<uint32_t>(round(m_vTotal * timeCalc) / m_frameTime);
 			vSync = static_cast<uint16_t>(vSyncCalc);
 		}
@@ -763,6 +822,11 @@ void GroovyMister::CmdBlit(uint32_t frame, uint8_t field, uint16_t vCountSync, u
 			LOG(0,"[MiSTer] LZ4 Adaptative apply LZ4HC on frame %d\n", frame);
 		}
 	}
+	if (m_lz4Frames && cSize == 0)
+	{
+		LOG(0, "[MiSTer] LZ4 compression failed for frame %u\n", frame);
+		return;
+	}
 
 	m_bufferSend[0] = CMD_BLIT_FIELD_VSYNC;
 	memcpy(&m_bufferSend[1], &frame, sizeof(frame));
@@ -824,7 +888,7 @@ void GroovyMister::CmdBlit(uint32_t frame, uint8_t field, uint16_t vCountSync, u
 
 void GroovyMister::CmdAudio(uint16_t soundSize)
 {
-	if (!fpga.audio || !m_isConnected)
+	if (!fpga.audio || !m_isConnected || soundSize == 0 || soundSize > AUDIO_BUFFER_SIZE)
 	{
 		return;
 	}
@@ -990,7 +1054,12 @@ int GroovyMister::DiffTimeRaster(void)
 }
 
 void GroovyMister::BindInputs(const char* misterHost, uint16_t misterPort)
-{	  
+{
+	if (!misterHost || !misterHost[0] || misterPort == 0)
+	{
+		return;
+	}
+
 	// Set server
 	m_serverAddrInputs.sin_family = AF_INET;
 	m_serverAddrInputs.sin_port = htons(misterPort);
@@ -998,11 +1067,20 @@ void GroovyMister::BindInputs(const char* misterHost, uint16_t misterPort)
 	// Set socket
 #ifdef _WIN32
 	WSADATA wsd;
-	uint16_t rc;
-	rc = ::WSAStartup(MAKEWORD(2, 2), &wsd);
-	if (rc != 0)
+	int rc = 0;
+	if (!m_winsockStarted)
 	{
-		LOG(0, "[MiSTer][Inputs] Unable to load Winsock: %d\n", rc);
+		rc = ::WSAStartup(MAKEWORD(2, 2), &wsd);
+		if (rc != 0)
+		{
+			LOG(0, "[MiSTer][Inputs] Unable to load Winsock: %d\n", rc);
+			return;
+		}
+		m_winsockStarted = true;
+	}
+	if (m_sockInputsFD != INVALID_SOCKET)
+	{
+		::closesocket(m_sockInputsFD);
 	}
 	m_sockInputsFD = INVALID_SOCKET;
 	LOG(0, "[MiSTer][Inputs] Initialising socket %s...\n","");
@@ -1010,6 +1088,7 @@ void GroovyMister::BindInputs(const char* misterHost, uint16_t misterPort)
 	if (m_sockInputsFD == INVALID_SOCKET)
 	{
 		LOG(0,"[MiSTer][Inputs] Could not create socket : %lu", ::GetLastError());
+		return;
 	}
 	LOG(0,"[MiSTer][Inputs] Setting socket async %s...\n","");
 	u_long iMode=1;
@@ -1017,29 +1096,43 @@ void GroovyMister::BindInputs(const char* misterHost, uint16_t misterPort)
 	if (rc < 0)
 	{
 		LOG(0,"[MiSTer][Inputs] set nonblock fail %d\n", rc);
+		::closesocket(m_sockInputsFD);
+		m_sockInputsFD = INVALID_SOCKET;
+		return;
 	}
 	LOG(0,"[MiSTer][Inputs] Binding port %s...\n","");
 		sendto(m_sockInputsFD, m_bufferSend, 1, 0, (struct sockaddr *)&m_serverAddrInputs, sizeof(m_serverAddrInputs));
 
 #else
 	printf("[MiSTer][Inputs] Initialising socket...\n");
+	if (m_sockInputsFD >= 0)
+	{
+		close(m_sockInputsFD);
+	}
 	m_sockInputsFD = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 	if (m_sockInputsFD < 0)
 	{
 		LOG(0,"[MiSTer][Inputs] Could not create socket : %d", m_sockInputsFD);
+		return;
 	}
 	LOG(0,"[MiSTer][Input] Setting socket async %s...\n","");
 	// Non blocking socket
 	int flags;
-	flags = fcntl(m_sockInputsFD, F_GETFD, 0);
+	flags = fcntl(m_sockInputsFD, F_GETFL, 0);
 	if (flags < 0)
 	{
 		LOG(0,"[MiSTer][Inputs] get falg error %d\n", flags);
+		close(m_sockInputsFD);
+		m_sockInputsFD = -1;
+		return;
 	}
 	flags |= O_NONBLOCK;
 	if (fcntl(m_sockInputsFD, F_SETFL, flags) < 0)
 	{
 		LOG(0,"[MiSTer] set nonblock fail %d\n", flags);
+		close(m_sockInputsFD);
+		m_sockInputsFD = -1;
+		return;
 	}
 	LOG(0,"[MiSTer][Inputs] Binding port %s...\n","");
 	sendto(m_sockInputsFD, m_bufferSend, 1, 0, (struct sockaddr *)&m_serverAddrInputs, sizeof(m_serverAddrInputs));
@@ -1048,6 +1141,15 @@ void GroovyMister::BindInputs(const char* misterHost, uint16_t misterPort)
 
 void GroovyMister::PollInputs(void)
 {
+#ifdef _WIN32
+	if (m_sockInputsFD == INVALID_SOCKET)
+#else
+	if (m_sockInputsFD < 0)
+#endif
+	{
+		return;
+	}
+
 	uint32_t joyFrame = joyInputs.joyFrame;
 	uint8_t  joyOrder = joyInputs.joyOrder;
 	uint32_t ps2Frame = ps2Inputs.ps2Frame;
@@ -1125,8 +1227,9 @@ char *GroovyMister::AllocateBufferSpace(const DWORD bufSize, const DWORD bufCoun
 
 	return lBuffer;
 #else
-	totalBufferSize = bufSize;
-	char *lBuffer = (char*)malloc((size_t)bufSize);
+	totalBufferCount = bufCount;
+	totalBufferSize = bufSize * bufCount;
+	char *lBuffer = (char*)malloc((size_t)totalBufferSize);
 	return lBuffer;
 #endif
 }
@@ -1134,6 +1237,10 @@ char *GroovyMister::AllocateBufferSpace(const DWORD bufSize, const DWORD bufCoun
 
 void GroovyMister::Send(void *cmd, int cmdSize)
 {
+	if (!cmd || cmdSize <= 0)
+	{
+		return;
+	}
 #ifdef _WIN32
 if (m_useRio)
 {
@@ -1146,7 +1253,13 @@ if (m_useRio)
 }
 
 void GroovyMister::SendStream(uint8_t whichBuffer, uint8_t field, uint32_t bytesToSend, uint32_t cSize)
-{	
+{
+	if (m_mtu == 0 || bytesToSend == 0 || bytesToSend > BUFFER_SIZE || field > 1 ||
+		(whichBuffer != 0 && whichBuffer != 1))
+	{
+		return;
+	}
+
 	uint32_t bytesSended = 0;
 #ifdef _WIN32
 if (m_useRio)
@@ -1155,17 +1268,22 @@ if (m_useRio)
 	int i=0;
 	while (bytesSended < bytesToSend)
 	{
+		if (i >= BUFFER_SLICES)
+		{
+			return;
+		}
+		uint32_t chunkSize = (bytesToSend - bytesSended >= m_mtu) ? m_mtu : bytesToSend - bytesSended;
 		if (whichBuffer == 0)
 		{
-			m_pBufsBlit[field][i].Length = (bytesToSend - bytesSended >= m_mtu) ? m_mtu : bytesToSend - bytesSended;
+			m_pBufsBlit[field][i].Length = chunkSize;
 			m_rio.RIOSend(m_requestQueue, &m_pBufsBlit[field][i], 1, flags, &m_pBufsBlit[field][i]);
 		}
 		else
 		{
-			m_pBufsAudio[i].Length = (bytesToSend - bytesSended >= m_mtu) ? m_mtu : bytesToSend - bytesSended;
+			m_pBufsAudio[i].Length = chunkSize;
 			m_rio.RIOSend(m_requestQueue, &m_pBufsAudio[i], 1, flags, &m_pBufsAudio[i]);
 		}
-		bytesSended += m_mtu;
+		bytesSended += chunkSize;
 		i++;
 	}
 	m_rio.RIOSend(m_requestQueue, NULL, 0, RIO_MSG_COMMIT_ONLY, NULL);
@@ -1190,7 +1308,7 @@ if (m_useRio)
 		{
 			Send(&m_pBufferAudio[bytesSended], chunkSize);
 		}
-		bytesSended += m_mtu;
+		bytesSended += chunkSize;
 	}
 }
 
@@ -1215,7 +1333,12 @@ inline void GroovyMister::setTimeEnd(void)
 uint32_t GroovyMister::DiffTime(void)
 {
 #ifdef _WIN32
-	return static_cast<uint32_t>(m_tickEnd.QuadPart - m_tickStart.QuadPart);
+	if (m_tickFrequency.QuadPart <= 0)
+	{
+		return 0;
+	}
+	long double ticks = (long double)(m_tickEnd.QuadPart - m_tickStart.QuadPart);
+	return static_cast<uint32_t>((ticks * 10000000.0L) / m_tickFrequency.QuadPart);
 #else
 	uint32_t diffTime = 0;
 	timespec temp;

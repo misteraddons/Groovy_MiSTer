@@ -23,10 +23,14 @@
 #define GROOVYMISTER_VERSION "1.0.0"
 #endif
 
-#define BUFFER_SIZE 1245312 // 720x576x3
-#define BUFFER_SLICES 846
+#define MAX_FRAME_WIDTH 720
+#define MAX_FRAME_HEIGHT 576
+#define MAX_PIXEL_BYTES 4
+#define BUFFER_SIZE (MAX_FRAME_WIDTH * MAX_FRAME_HEIGHT * MAX_PIXEL_BYTES)
 #define MTU_HEADER 28
-#define BUFFER_MTU 1500 - MTU_HEADER
+#define BUFFER_MTU (1500 - MTU_HEADER)
+#define BUFFER_SLICES ((BUFFER_SIZE + BUFFER_MTU - 1) / BUFFER_MTU)
+#define AUDIO_BUFFER_SIZE 32768
 
 //joystick map
 #define GM_JOY_RIGHT (1 << 0)
@@ -139,6 +143,7 @@ class GroovyMister
 	RIO_CQ m_receiveQueue;
 	RIO_RQ m_requestQueue;
 	HANDLE m_hIOCP;
+	OVERLAPPED m_overlapped;
 	RIO_BUFFERID m_sendRioBufferId;
 	RIO_BUF m_sendRioBuffer;
 	RIO_BUFFERID m_receiveRioBufferId;
@@ -156,6 +161,7 @@ class GroovyMister
 	LARGE_INTEGER m_tickEnd;
 	LARGE_INTEGER m_tickSync;
 	LARGE_INTEGER m_tickCongestion;
+	LARGE_INTEGER m_tickFrequency;
 #else
 	int m_sockFD;
 	int m_sockInputsFD;
@@ -191,6 +197,7 @@ class GroovyMister
 	uint32_t m_network_ping;
 	uint8_t m_delta_enabled[2];
 	uint8_t m_isConnected;
+	uint8_t m_modeConfigured;
 
 	char *AllocateBufferSpace(const DWORD bufSize, const DWORD bufCount, DWORD& totalBufferSize, DWORD& totalBufferCount);
 	void Send(void *cmd, int cmdSize);

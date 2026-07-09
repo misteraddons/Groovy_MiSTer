@@ -4,8 +4,7 @@ using std::cout;
 using std::endl;
 
 //mingw missing headers
-//#if defined(_WIN32) && !defined(WSA_FLAG_REGISTERED_IO)
-#if defined(_WIN32)
+#if defined(_WIN32) && defined(__MINGW32__)
 #ifndef WSA_FLAG_REGISTERED_IO
 #define WSA_FLAG_REGISTERED_IO 0x100
 #endif
@@ -22,10 +21,9 @@ using std::endl;
    * typedef struct RIO_RQ_t *RIO_RQ, **PRIO_RQ;
    * But since RIO_BUFFERID_t, RIO_CQ_t and RIO_RQ_t are not defined I replaced these with void.
    */
-/*typedef void *RIO_BUFFERID, **PRIO_BUFFERID;
+typedef void *RIO_BUFFERID, **PRIO_BUFFERID;
 typedef void *RIO_CQ, **PRIO_CQ;
 typedef void *RIO_RQ, **PRIO_RQ;
-*/
 
 #define RIO_MSG_DONT_NOTIFY           0x00000001
 #define RIO_MSG_DEFER                 0x00000002
@@ -39,18 +37,18 @@ typedef void *RIO_RQ, **PRIO_RQ;
 #define RIO_MAX_CQ_SIZE               0x8000000
 #define RIO_CORRUPT_CQ                0xFFFFFFFF
 
-/*typedef struct _RIORESULT {
+typedef struct _RIORESULT {
   LONG Status;
   ULONG BytesTransferred;
   ULONGLONG SocketContext;
   ULONGLONG RequestContext;
-} RIORESULT, *PRIORESULT;*/
+} RIORESULT, *PRIORESULT;
 
-/*typedef struct _RIO_BUF {
+typedef struct _RIO_BUF {
   RIO_BUFFERID BufferId;
   ULONG Offset;
   ULONG Length;
-} RIO_BUF, *PRIO_BUF;*/
+} RIO_BUF, *PRIO_BUF;
 
 typedef BOOL(PASCAL FAR *LPFN_RIORECEIVE)(
     _In_ RIO_RQ SocketQueue, _In_reads_(DataBufferCount) PRIO_BUF pData,
@@ -74,13 +72,13 @@ typedef BOOL(PASCAL FAR *LPFN_RIOSENDEX)(
 
 typedef VOID(PASCAL FAR *LPFN_RIOCLOSECOMPLETIONQUEUE)(_In_ RIO_CQ CQ);
 
-/*typedef enum _RIO_NOTIFICATION_COMPLETION_TYPE {
+typedef enum _RIO_NOTIFICATION_COMPLETION_TYPE {
   RIO_EVENT_COMPLETION = 1,
   RIO_IOCP_COMPLETION = 2,
 } RIO_NOTIFICATION_COMPLETION_TYPE,
-    *PRIO_NOTIFICATION_COMPLETION_TYPE;*/
+    *PRIO_NOTIFICATION_COMPLETION_TYPE;
 
-/*typedef struct _RIO_NOTIFICATION_COMPLETION {
+typedef struct _RIO_NOTIFICATION_COMPLETION {
   RIO_NOTIFICATION_COMPLETION_TYPE Type;
   union {
     struct {
@@ -93,7 +91,7 @@ typedef VOID(PASCAL FAR *LPFN_RIOCLOSECOMPLETIONQUEUE)(_In_ RIO_CQ CQ);
       PVOID Overlapped;
     } Iocp;
   };
-} RIO_NOTIFICATION_COMPLETION, *PRIO_NOTIFICATION_COMPLETION;*/
+} RIO_NOTIFICATION_COMPLETION, *PRIO_NOTIFICATION_COMPLETION;
 
 typedef RIO_CQ(PASCAL FAR *LPFN_RIOCREATECOMPLETIONQUEUE)(
     _In_ DWORD QueueSize,
@@ -123,7 +121,7 @@ typedef BOOL(PASCAL FAR *LPFN_RIORESIZEREQUESTQUEUE)(
     _In_ RIO_RQ RQ, _In_ DWORD MaxOutstandingReceive,
     _In_ DWORD MaxOutstandingSend);
 
-/*typedef struct _RIO_EXTENSION_FUNCTION_TABLE {
+typedef struct _RIO_EXTENSION_FUNCTION_TABLE {
   DWORD cbSize;
   LPFN_RIORECEIVE RIOReceive;
   LPFN_RIORECEIVEEX RIOReceiveEx;
@@ -138,7 +136,7 @@ typedef BOOL(PASCAL FAR *LPFN_RIORESIZEREQUESTQUEUE)(
   LPFN_RIOREGISTERBUFFER RIORegisterBuffer;
   LPFN_RIORESIZECOMPLETIONQUEUE RIOResizeCompletionQueue;
   LPFN_RIORESIZEREQUESTQUEUE RIOResizeRequestQueue;
-} RIO_EXTENSION_FUNCTION_TABLE, *PRIO_EXTENSION_FUNCTION_TABLE;*/
+} RIO_EXTENSION_FUNCTION_TABLE, *PRIO_EXTENSION_FUNCTION_TABLE;
 
 #endif
 
