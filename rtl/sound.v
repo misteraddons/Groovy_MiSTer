@@ -37,9 +37,13 @@ parameter MAX_BURST = 32'd512;
 
 
 reg sound_start = 1'b0;
+(* altera_attribute = "-name SYNCHRONIZER_IDENTIFICATION FORCED" *) reg sound_start_meta = 1'b0;
+(* altera_attribute = "-name SYNCHRONIZER_IDENTIFICATION FORCED" *) reg sound_start_audio = 1'b0;
 
 reg[15:0] samples_skip = 16'd0;
 reg[15:0] samples_lost = 16'd0;
+(* altera_attribute = "-name SYNCHRONIZER_IDENTIFICATION FORCED" *) reg[15:0] samples_lost_meta = 16'd0;
+(* altera_attribute = "-name SYNCHRONIZER_IDENTIFICATION FORCED" *) reg[15:0] samples_lost_sync = 16'd0;
 reg[15:0] samples_to_start = 16'd0;
 
 reg[15:0] sound_left;
@@ -122,11 +126,15 @@ fifo_sound fifo_3(
 
 // write sample
 always@(posedge clk_sys) begin                             
+	 samples_lost_meta <= samples_lost;
+	 samples_lost_sync <= samples_lost_meta;
         
    if (sound_reset) begin
      sound_start      <= 1'b0;         
      samples_skip     <= 1'b0;
      samples_to_start <= 1'b0;
+	 samples_lost_meta <= 16'd0;
+	 samples_lost_sync <= 16'd0;
      fifo_wr1         <= 2'd0;                                                                                                                  
      fifo_wr2         <= 2'd1;                                                                                                                  
      fifo_wr3         <= 2'd2;   
@@ -141,7 +149,7 @@ always@(posedge clk_sys) begin
    sound_wrreq[3] <= 1'b0;
      
    if (sound_wren1 && vga_frame >= 32'd1) begin    
-     if (samples_skip < samples_lost) begin //avoid acum. delayed sound
+     if (samples_skip < samples_lost_sync) begin //avoid acum. delayed sound
        if (sound_chan > 1'b1) begin
          samples_skip <= samples_skip + ((sound_wren1 + sound_wren2 + sound_wren3 + sound_wren4) >> 1);
        end else begin
@@ -184,16 +192,20 @@ always@(posedge clk_sys) begin
      end    
    end             
         
-   if (samples_lost == 16'd0) samples_skip <= 16'd0;
+   if (samples_lost_sync == 16'd0) samples_skip <= 16'd0;
         
 end
 
 
 // get sample
 always@(posedge clk_audio) begin                                                        
+	 sound_start_meta <= sound_start;
+	 sound_start_audio <= sound_start_meta;
    
    if (sound_reset) begin
      samples_lost <= 1'b0;
+	 sound_start_meta <= 1'b0;
+	 sound_start_audio <= 1'b0;
      fifo_rd      <= 2'd0;
      fifo_rd_next <= 2'd1;                           
    end
@@ -203,7 +215,7 @@ always@(posedge clk_audio) begin
    sound_rdreq[2] <= 1'b0;
    sound_rdreq[3] <= 1'b0;
         
-   if (sound_start) begin                
+   if (sound_start_audio) begin
      if (audio_cnt == clocks_per_sample - 1'b1) begin
        audio_cnt     <= 16'd0;
        sound_rdreq[fifo_rd]      <= (fifo_rdempty[fifo_rd]      || sound_chan == 1'b0) ? 1'b0 : 1'b1;
